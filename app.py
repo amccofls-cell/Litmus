@@ -241,6 +241,158 @@ def move_selected_items(delta):
     st.session_state.sel_table_ver = st.session_state.get("sel_table_ver", 0) + 1
 
 
+# ── 앱 입력용 파일로 품목 추가 (원내 비교 후보 추출 프로그램에서 만든 파일) ──
+APP_INPUT_COLUMNS = ["구분", "약품명", "성분명", "보험코드"]
+STRENGTH_IN_NAME = re.compile(r"\d+(?:\.\d+)?\s*(?:마이크로그램|밀리그램|그램|밀리리터|mcg|μg|ug|mg|g|ml|mL|%)", re.IGNORECASE)
+
+
+def normalize_product_name(name):
+    """제품명 비교용: 심평원 이름 끝의 '_(규격)'과 띄어쓰기를 빼고 대소문자를 맞춥니다."""
+    value = re.sub(r"_\(.*?\)\s*$", "", clean_whitespace(name))
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def product_name_index(rows):
+    index = {}
+    for row in rows:
+        index.setdefault(normalize_product_name(row.get("ITEM_NAME", "")), []).append(row)
+    return index
+
+
+def name_candidates(rows, name, limit=20):
+    """자동 연결이 안 될 때 고를 수 있도록, 함량·괄호를 뺀 이름이 들어간 식약처 품목을 보여 줍니다."""
+    base = re.sub(r"\(.*?\)|\[.*?\]", "", clean_whitespace(name))
+    base = normalize_product_name(STRENGTH_IN_NAME.sub("", base))
+    if len(base) < 2:
+        return []
+    return [row for row in rows if base in normalize_product_name(row.get("ITEM_NAME", ""))][:limit]
+
+
+# 성분명 비교용: 염·수화물 표기는 뺍니다 (원내 비교 후보 추출 프로그램과 같은 규칙)
+SALT_WORDS_KO = [
+    "브롬화수소산염", "타르타르산염", "시트르산염", "말레산염", "베실산염", "메실산염", "푸마르산염", "숙신산염",
+    "아세트산염", "염산염", "황산염", "인산염", "베실레이트", "삼수화물", "이수화물", "일수화물", "수화물",
+    "무수물", "미분화", "나트륨", "칼륨", "칼슘", "마그네슘",
+]
+SALT_WORDS_EN = [
+    "hydrobromide", "hydrochloride", "bitartrate", "tartrate", "citrate", "maleate", "besylate", "besilate",
+    "mesylate", "mesilate", "fumarate", "succinate", "phosphate", "acetate", "sulfate", "sulphate", "hcl",
+    "monohydrate", "dihydrate", "trihydrate", "hydrate", "anhydrous", "micronized", "micronised",
+    "sodium", "potassium", "calcium", "magnesium",
+]
+
+
+def ingredient_keys(text):
+    """성분명을 비교용 성분 묶음으로 바꿉니다. 예: '펜타닐시트르산염' → {'펜타닐'}, 'Oxycodone HCl/Naloxone' → {'oxycodone', 'naloxone'}"""
+    keys = set()
+    for part in re.split(r"[|+/,·;]|\s및\s|\sand\s", clean_ingredient(text or ""), flags=re.IGNORECASE):
+        value = re.sub(r"\(.*?\)|\[.*?\]", " ", part).lower()
+        value = re.sub(r"^\s*\d+(?:,\d+)*-", "", value)  # 앞의 위치 번호는 뺍니다: '5-fluorouracil' = 'fluorouracil'
+        for word in SALT_WORDS_EN:
+            value = re.sub(rf"\b{word}\b", " ", value)
+        for word in SALT_WORDS_KO:
+            value = value.replace(word, " ")
+        value = re.sub(r"[^0-9a-z가-힣]", "", value)
+        if value:
+            keys.add(value)
+    return frozenset(keys)
+
+
+def ingredient_index(rows):
+    """성분 묶음 → 식약처 품목 목록. 한글·영문 성분명 둘 다로 찾을 수 있게 만듭니다."""
+    index = {}
+    for row in rows:
+        for keys in {ingredient_keys(row.get("MAIN_ITEM_INGR", "")), ingredient_keys(row.get("MAIN_INGR_ENG", ""))}:
+            if keys:
+                index.setdefault(keys, []).append(row)
+    return index
+
+
+def ingredient_candidates(index, ingredient, limit=20):
+    """이름으로도 못 찾을 때, 성분이 같은 식약처 품목을 후보로 보여 줍니다 (자동 연결은 하지 않음)."""
+    return index.get(ingredient_keys(ingredient), [])[:limit]
+
+
+def link_app_input(frame, rows, mfds_key, hira_key):
+    """앱 입력용 파일의 줄마다 식약처 품목을 찾습니다. 비슷한 이름이나 같은 성분만으로는 자동 연결하지 않습니다.
+
+    찾는 순서: EDI(보험)코드 → 한글 약품명 → 성분명
+    1) 보험코드 → 심평원 제품명 → 같은 이름의 식약처 품목 → 바코드 4~11번째 = 보험코드 앞 8자리면 자동 연결
+    2) 식약처 제품명과 완전히 같으면 자동 연결
+    3) 나머지는 후보를 보여 주고 약사가 고름: 보험코드로 찾은 품목 → 이름이 들어간 품목 → 성분이 같은 품목 순
+    """
+    name_index = product_name_index(rows)
+    by_ingredient = None  # 성분으로 찾을 일이 생길 때 한 번만 만듭니다
+    cache_detail = load_json_cache(CACHE_DETAIL_FILE)
+    call_counter = {"hira": 0, "mfds": 0}
+    errors, links = [], []
+    for _, row in frame.iterrows():
+        edi = next((code for code in (normalize_code_digits(v) for v in str(row.get("보험코드", "")).split()) if code), "")
+        name = clean_whitespace(row.get("약품명", ""))
+        ingredient = clean_whitespace(row.get("성분명", ""))
+        link = {"구분": clean_whitespace(row.get("구분", "")), "입력 약품명": name, "보험코드": edi,
+                "seq": "", "연결 품목": "", "방법": "", "후보": [], "후보 근거": ""}
+        if edi and hira_key:
+            try:
+                items = hira_get(hira_key, {"mdsCd": edi})
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"HIRA mdsCd={edi}: {exc}")
+                items = []
+            for item in (it for it in items if hira_code(it) == edi):
+                matches = name_index.get(normalize_product_name(item.get("itmNm", "")), [])
+                for match in matches:
+                    detail = fetch_detail(match["ITEM_SEQ"], mfds_key, call_counter, cache_detail, [], errors)
+                    if any(code[3:11] == edi[:8] for code in split_barcode_values(detail.get("_bar_code", ""))):
+                        link.update(seq=match["ITEM_SEQ"], 방법="보험코드 → 심평원 제품명 → 바코드 확인")
+                        break
+                if link["seq"]:
+                    break
+                if matches and not link["후보"]:
+                    link.update(후보=matches, **{"후보 근거": "보험코드"})
+        if not link["seq"]:
+            matches = name_index.get(normalize_product_name(name), [])
+            if len(matches) == 1:
+                link.update(seq=matches[0]["ITEM_SEQ"], 방법="식약처 제품명 완전일치")
+            elif not link["후보"]:
+                candidates, basis = matches or name_candidates(rows, name), "약품명"
+                if not candidates and ingredient:
+                    by_ingredient = by_ingredient if by_ingredient is not None else ingredient_index(rows)
+                    candidates, basis = ingredient_candidates(by_ingredient, ingredient), "성분명"
+                if candidates:
+                    link.update(후보=candidates, **{"후보 근거": basis})
+        if link["seq"]:
+            matched = next(r for r in rows if r.get("ITEM_SEQ") == link["seq"])
+            link["연결 품목"] = clean_whitespace(matched.get("ITEM_NAME", ""))
+        link["후보"] = [{"ITEM_SEQ": r.get("ITEM_SEQ", ""), "ITEM_NAME": r.get("ITEM_NAME", ""), "ENTP_NAME": r.get("ENTP_NAME", "")}
+                       for r in link["후보"]]
+        links.append(link)
+    save_json_cache(CACHE_DETAIL_FILE, cache_detail)
+    return links, errors
+
+
+def apply_file_links(links, replace):
+    """연결된 품목을 신청의약품·비교의약품 그룹에 넣고 그룹 모드를 켭니다. (버튼 on_click용)"""
+    if replace:
+        st.session_state.groups = {"applicant": {"label": "신청의약품", "seqs": []}}
+        st.session_state.strength_overrides = {}
+    for index, link in enumerate(links):
+        seq = link["seq"]
+        if not seq:
+            pick = st.session_state.get(f"link_pick_{index}", "")
+            seq = pick.rsplit(" · ", 1)[-1] if " · " in pick else ""
+        if not seq:
+            continue
+        if link["구분"] == "신청의약품":
+            gid = "applicant"
+        else:
+            gid = f"comparator_{re.sub(r'[^0-9]', '', link['구분']) or '1'}"
+        st.session_state.groups.setdefault(gid, {"label": group_label(gid), "seqs": []})
+        assign_seqs_to_group(gid, [seq])
+    st.session_state.group_mode = True
+    st.session_state.group_mode_previous = True  # 그룹 모드로 바뀔 때 예전 조회 목록이 신청의약품으로 섞이지 않게 합니다.
+    st.session_state.file_links = None
+
+
 def build_group_items(by_seq):
     items = []
     for gid in ordered_group_ids(st.session_state.groups):
@@ -994,7 +1146,9 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
 
 def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, include_all_fields=False):
     cached = cache_detail.get(item_seq, {})
-    have_base = "성분명" in cached
+    # 효능효과·용법용량이 비어서 저장된 기록은 완성된 것으로 보지 않고 다시 조회합니다.
+    # (식약처가 문서 항목을 비워 보내는 날이 있어, 그 빈 값이 계속 남지 않게 합니다)
+    have_base = "성분명" in cached and bool(cached.get("효능효과") or cached.get("용법용량"))
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
     have_all_fields = "_all_api_fields" in cached
     if have_base and not missing_extras and (not include_all_fields or have_all_fields):
@@ -1974,6 +2128,41 @@ if group_mode and not previous_group_mode:
 elif not group_mode and previous_group_mode:
     st.session_state.selection = list(dict.fromkeys(flatten_group_seqs()))
 st.session_state.group_mode_previous = group_mode
+
+with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프로그램의 '앱 입력용 파일')"):
+    st.caption(
+        "EDI(보험)코드 → 한글 약품명 → 성분명 순서로 찾습니다. "
+        "보험코드가 있으면 심평원 제품명과 바코드로 확인해 자동으로 연결하고, 없으면 식약처 제품명과 완전히 같을 때만 자동으로 연결합니다. "
+        "나머지는 이름이나 성분이 같은 후보 중에서 직접 골라 주세요."
+    )
+    app_input_file = st.file_uploader("앱 입력용 파일 (xlsx)", type=["xlsx"], key="app_input_file")
+    replace_groups = st.checkbox("지금 고른 품목을 비우고 파일 내용으로 새로 채우기", value=True, key="app_input_replace")
+    if app_input_file and st.button("파일 읽고 품목 연결하기", disabled=not hira_key):
+        input_frame = pd.read_excel(app_input_file, dtype=str).fillna("")
+        missing_columns = [column for column in APP_INPUT_COLUMNS if column not in input_frame.columns]
+        if missing_columns:
+            st.error(f"앱 입력용 파일에 {', '.join(missing_columns)} 열이 없습니다.")
+        else:
+            with st.spinner("보험코드, 약품명, 성분명으로 품목을 찾는 중입니다…"):
+                st.session_state.file_links, link_errors = link_app_input(input_frame, normal_rows, mfds_key, hira_key)
+            for link_error in link_errors:
+                st.warning(link_error)
+    file_links = st.session_state.get("file_links")
+    if file_links:
+        auto_count = sum(1 for link in file_links if link["seq"])
+        st.markdown(f"**자동 연결 {auto_count}건 / 직접 확인 {len(file_links) - auto_count}건**")
+        for index, link in enumerate(file_links):
+            label = f"{link['구분']} · {link['입력 약품명']}" + (f" (보험코드 {link['보험코드']})" if link["보험코드"] else "")
+            if link["seq"]:
+                st.markdown(f"✅ {label} → **{link['연결 품목']}** · {link['방법']}")
+            else:
+                choices = ["(넣지 않음)"] + [f"{c['ITEM_NAME']} · {c['ENTP_NAME']} · {c['ITEM_SEQ']}" for c in link["후보"]]
+                st.selectbox(
+                    f"⚠️ {label} — " + (f"{link.get('후보 근거') or '이름'}으로 찾은 후보 중에서 골라 주세요" if link["후보"]
+                                       else "찾지 못했습니다. 검색에서 직접 추가해 주세요"),
+                    choices, key=f"link_pick_{index}",
+                )
+        st.button("그룹에 추가", type="primary", on_click=apply_file_links, args=(file_links, replace_groups))
 
 query = st.text_input(
     "의약품명 · 제약사명 · 성분명 · 주성분 영문명",
