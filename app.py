@@ -540,6 +540,41 @@ def parse_doc_sections(xml_str, keywords):
     return clean_markup(" ".join(picked))
 
 
+def parse_text_sections(text, keywords):
+    """PDF에서 읽은 사용상 주의사항 글에서 '4. 이상반응'처럼 번호로 시작하는 소제목 줄을 찾아, 키워드에 맞는 항목만 꺼냅니다.
+
+    소제목은 줄 맨 앞의 번호가 1, 2, 3… 차례로 커지고, 알려진 항목 이름(경고, 금기, 이상반응 등)이 들어 있는 줄만 인정합니다.
+    (본문 안의 '1) 2)'나 용량 숫자를 소제목으로 착각하지 않도록)
+    """
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words} | {"경고"}
+    headings, last = [], 0
+    for index, line in enumerate(lines):
+        match = re.match(r"\s*(\d{1,2})\s*\.\s*(?=[가-힣])", line)
+        if not match:
+            continue
+        title = normalize_section_title(line[match.end():])
+        if int(match.group(1)) == last + 1 and any(word in title for word in known if word):
+            headings.append((index, title))
+            last = int(match.group(1))
+    wanted = [normalize_section_title(k) for k in keywords if k]
+    picked = []
+    for n, (index, title) in enumerate(headings):
+        if any(word in title for word in wanted if word):
+            end = headings[n + 1][0] if n + 1 < len(headings) else len(lines)
+            picked.append(join_wrapped_lines(lines[index:end]))
+    return clean_whitespace(" ".join(picked))
+
+
+def doc_section(cached, keywords):
+    """사용상 주의사항 세부 항목: XML이 있으면 XML에서, 없으면 PDF에서 읽은 글에서 꺼냅니다."""
+    if (cached.get("_raw_nb_xml") or "").strip():
+        return parse_doc_sections(cached["_raw_nb_xml"], keywords)
+    return parse_text_sections(cached.get("_raw_nb_text", ""), keywords)
+
+
 def summarize_text(text, max_chars=420, max_sentences=3):
     """의학적 판단을 새로 생성하지 않고, 원문 앞부분과 핵심 문장만 발췌합니다."""
     text = clean_whitespace(text)
@@ -1149,6 +1184,10 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     # 효능효과·용법용량이 비어서 저장된 기록은 완성된 것으로 보지 않고 다시 조회합니다.
     # (식약처가 문서 항목을 비워 보내는 날이 있어, 그 빈 값이 계속 남지 않게 합니다)
     have_base = "성분명" in cached and bool(cached.get("효능효과") or cached.get("용법용량"))
+    # 예전 버전이 PDF 글자를 띄어쓰기(NUL 글자 \x00)째로 저장한 기록도 다시 조회합니다.
+    if any("\x00" in str(cached.get(key, "")) for key in ("효능효과", "용법용량", "_raw_nb_text")):
+        have_base = False
+        cached.pop("_raw_nb_text", None)
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
     have_all_fields = "_all_api_fields" in cached
     if have_base and not missing_extras and (not include_all_fields or have_all_fields):
@@ -1157,12 +1196,14 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
         for key in missing_extras
     )
-    if have_base and "_raw_nb_xml" in cached and cached_direct_ready and (not include_all_fields or have_all_fields):
+    section_missing = any(key not in EXTRA_DIRECT_FIELDS for key in missing_extras)
+    nb_ready = bool((cached.get("_raw_nb_xml") or "").strip() or cached.get("_raw_nb_text")) or not section_missing
+    if have_base and "_raw_nb_xml" in cached and nb_ready and cached_direct_ready and (not include_all_fields or have_all_fields):
         for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
                 cached[key] = cached.get("_raw_" + key, "")
             else:
-                cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
+                cached[key] = doc_section(cached, EXTRA_FIELD_KEYWORDS[key])
         cache_detail[item_seq] = cached
         return cached
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
@@ -1187,12 +1228,14 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         cached["효능효과"], _ = fetch_doc_by_id(item.get("EE_DOC_ID", ""), errors, f"효능효과 item_seq={item_seq}")
     if not cached["용법용량"]:
         cached["용법용량"], _ = fetch_doc_by_id(item.get("UD_DOC_ID", ""), errors, f"용법용량 item_seq={item_seq}")
-    if not nb_xml.strip() and wanted_extras:
-        _, nb_xml = fetch_doc_by_id(item.get("NB_DOC_ID", ""), errors, f"사용상 주의사항 item_seq={item_seq}")
+    nb_text = ""
+    if not nb_xml.strip() and any(key not in EXTRA_DIRECT_FIELDS for key in wanted_extras):
+        nb_text, nb_xml = fetch_doc_by_id(item.get("NB_DOC_ID", ""), errors, f"사용상 주의사항 item_seq={item_seq}", keep_lines=True)
     # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
+    cached["_raw_nb_text"] = "" if nb_xml.strip() else nb_text
     cached["_all_api_fields"] = sanitize_all_api_fields({
         str(key): clean_whitespace(value)
         for key, value in item.items()
@@ -1201,7 +1244,7 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
     for key in wanted_extras:
-        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
+        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else doc_section(cached, EXTRA_FIELD_KEYWORDS[key])
     cache_detail[item_seq] = cached
     return cached
 
@@ -1224,7 +1267,39 @@ def doc_urls(doc_id):
     return urls
 
 
-def fetch_doc_by_id(doc_id, errors=None, label=""):
+def pdf_plain_text(pages):
+    """PDF 글자를 꺼냅니다. 식약처 PDF는 띄어쓰기가 보이지 않는 NUL 글자(\\x00)로 나오고,
+    같은 줄이 두 번씩 나오는 곳이 있어서 띄어쓰기로 바꾸고 바로 이어 반복된 줄은 하나만 남깁니다."""
+    lines = []
+    for page in pages:
+        for line in (page.extract_text() or "").replace("\x00", " ").splitlines():
+            if not lines or line.strip() != lines[-1].strip():
+                lines.append(line)
+    return "\n".join(lines)
+
+
+LIST_MARKER = re.compile(r"^\s*(\d{1,2}\s*[.)]|\(\d{1,2}\)|[가-하]\s*\.|[①-⑳]|[-·•※*<]|[A-Za-z가-힣/ ]{1,15}:\s*\S)")  # '혈관계: 홍조'처럼 뒤에 내용이 있는 이름표만
+
+
+def join_wrapped_lines(lines):
+    """PDF에서 한 문장이 줄바꿈으로 잘린 곳을 다시 잇습니다.
+    앞줄이 띄어쓰기로 끝나면 띄어 쓰고, 긴 줄이 낱말 중간에서 잘린 곳('투' + '여')은 붙입니다.
+    다음 줄이 '1)', '(2)', '혈관계:'처럼 새 항목으로 시작하면 띄어 씁니다."""
+    text, previous = "", ""
+    for line in lines:
+        if not line.strip():
+            continue
+        if not text:
+            text = line.strip()
+        elif previous.endswith(" ") or len(previous.strip()) < 40 or LIST_MARKER.match(line):
+            text += " " + line.strip()
+        else:
+            text += line.strip()
+        previous = line
+    return clean_whitespace(text)
+
+
+def fetch_doc_by_id(doc_id, errors=None, label="", keep_lines=False):
     """식약처가 문서 본문(EE/UD/NB_DOC_DATA)을 비워 보낼 때, 문서 주소(EE/UD/NB_DOC_ID)에서 직접 받아옵니다.
 
     PDF나 XML일 때만 씁니다. 오류 안내 웹페이지(HTML) 같은 것은 효능효과로 넣지 않습니다.
@@ -1243,7 +1318,9 @@ def fetch_doc_by_id(doc_id, errors=None, label=""):
             try:
                 from pypdf import PdfReader
                 pages = PdfReader(io.BytesIO(body)).pages
-                text = clean_markup(" ".join((page.extract_text() or "") for page in pages))
+                raw_text = pdf_plain_text(pages)
+                # keep_lines: 사용상 주의사항처럼 줄 단위 소제목으로 나눌 문서는 줄바꿈을 남깁니다 (줄 끝 띄어쓰기도 남김).
+                text = raw_text if keep_lines else join_wrapped_lines(raw_text.splitlines())
             except Exception as exc:  # 깨진 PDF 등: 이유를 남기고 다음 주소를 시도합니다.
                 problems.append(f"{url}: PDF 읽기 실패 {exc}")
                 continue
@@ -2143,8 +2220,11 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
+APP_VERSION = "2026-10-26c · 식약처 PDF 문서 대응"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
+
 with st.sidebar:
     st.header("환경 설정")
+    st.caption(f"앱 버전: {APP_VERSION}")
     try:
         secret_mfds = st.secrets.get("MFDS_KEY", "")
         secret_hira = st.secrets.get("HIRA_KEY", "")
