@@ -27,7 +27,9 @@ DOSAGE_CHOICES = ["원문", "자동(추천)", "간단", "일반", "상세"]
 
 # Excel 안에서 용법·용량 원문을 담는 시트. fill_dosage.py가 이 시트를 읽습니다.
 SOURCE_SHEET = "용법용량 원문"
-SOURCE_HEADERS = ["비교표 열 이름", "품목코드", "허가제품명", "효능효과 원문", "용법용량 원문"]
+SOURCE_HEADERS = ["비교표 열 이름", "품목코드", "허가제품명", "효능효과 원문", "용법용량 원문", "비교표 시트"]
+SOURCE_KEYS = ["column", "id", "name", "indications_text", "dosage_text", "sheet"]
+COMPARISON_SHEET = "비교표"  # 한 번에 하나 만들 때. 신청번호별로 만들 때는 '신청1', '신청2' … 시트
 
 
 def _clean(text):
@@ -326,11 +328,11 @@ def _write_source_sheet(sheet, dosage_sources):
         cell.fill = s["header_fill"]
         cell.border = s["border"]
     for row_index, source in enumerate(dosage_sources, start=2):
-        for col_index, key in enumerate(["column", "id", "name", "indications_text", "dosage_text"], start=1):
-            cell = sheet.cell(row=row_index, column=col_index, value=str(source.get(key, "")))
+        for col_index, key in enumerate(SOURCE_KEYS, start=1):
+            cell = sheet.cell(row=row_index, column=col_index, value=str(source.get(key, "") or (COMPARISON_SHEET if key == "sheet" else "")))
             cell.alignment = s["wrap"]
             cell.border = s["border"]
-    for letter, width in zip("ABCDE", [36, 14, 28, 50, 80]):
+    for letter, width in zip("ABCDEF", [36, 14, 28, 50, 80, 14]):
         sheet.column_dimensions[letter].width = width
     sheet.freeze_panes = "A2"
 
@@ -349,7 +351,7 @@ def to_excel_bytes(comparison_df=None, detail_df=None, title="의약품 비교�
         f"'{STATUS_FAILED}'는 API 호출이 실패한 칸, '{STATUS_EMPTY}'은 조회는 됐지만 내용이 없는 칸입니다.",
     ]
     if comparison_df is not None and len(comparison_df.columns):
-        comparison_sheet = workbook.create_sheet("비교표")
+        comparison_sheet = workbook.create_sheet(COMPARISON_SHEET)
         _write_sheet(comparison_sheet, comparison_df, title, notes, "항목", True)
         apply_comparison_merges(comparison_sheet)
     if detail_df is not None and len(detail_df):
@@ -359,6 +361,53 @@ def to_excel_bytes(comparison_df=None, detail_df=None, title="의약품 비교�
         _write_source_sheet(workbook.create_sheet(SOURCE_SHEET), dosage_sources)
     if not workbook.sheetnames:
         workbook.create_sheet("비교표")
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def comparison_sheet_names(workbook):
+    """비교표 시트 이름들: '비교표' 하나, 또는 신청번호별 '신청1', '신청2' …"""
+    if COMPARISON_SHEET in workbook.sheetnames:
+        return [COMPARISON_SHEET]
+    return [name for name in workbook.sheetnames if re.match(r"^신청\d+", name)]
+
+
+def to_excel_bytes_by_number(parts, title="의약품 비교표", note_lines=None):
+    """신청번호마다 비교표 시트를 따로 만듭니다: 시트 '신청1'에 신청의약품1과 그 비교약, '신청2'에 신청의약품2와 그 비교약 …
+
+    parts: [{"number": "신청1", "name": 대표 제품명, "comparison": 비교표 DataFrame, "detail": 상세 DataFrame, "sources": 용법용량 원문}]
+    상세결과와 용법용량 원문은 한 시트에 모으고 신청번호를 함께 적습니다.
+    """
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    notes = list(note_lines or []) + [
+        "회색 행(원내코드, code open, 처방건수, 비급여)은 약사가 직접 입력합니다.",
+        f"'{STATUS_FAILED}'는 API 호출이 실패한 칸, '{STATUS_EMPTY}'은 조회는 됐지만 내용이 없는 칸입니다.",
+    ]
+    details, sources = [], []
+    for part in parts:
+        sheet_name = re.sub(r"[\\/*?:\[\]]", "", part["number"])[:31] or "신청"
+        comparison = part.get("comparison")
+        if comparison is not None and len(comparison.columns):
+            sheet = workbook.create_sheet(sheet_name)
+            _write_sheet(sheet, comparison, f"{title} — {part['number']} {part.get('name', '')}".strip(), notes, "항목", True)
+            apply_comparison_merges(sheet)
+        detail = part.get("detail")
+        if detail is not None and len(detail):
+            details.append(detail.assign(신청번호=part["number"])[["신청번호"] + list(detail.columns)])
+        sources += [dict(source, sheet=sheet_name) for source in part.get("sources") or []]
+    if details:
+        import pandas as pd
+        detail_all = pd.concat(details, ignore_index=True)
+        detail_t = detail_all.set_index("허가제품명").T if "허가제품명" in detail_all.columns else detail_all
+        _write_sheet(workbook.create_sheet("상세결과"), detail_t, f"{title} — 상세 결과 (신청번호 행 참고)", notes, "항목", False)
+    if sources:
+        _write_source_sheet(workbook.create_sheet(SOURCE_SHEET), sources)
+    if not workbook.sheetnames:
+        workbook.create_sheet(COMPARISON_SHEET)
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
