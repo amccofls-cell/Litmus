@@ -26,6 +26,8 @@ DOSAGE_LEVEL_KEYS = {"간단": "simple", "일반": "general", "상세": "detaile
 DOSAGE_CHOICES = ["원문", "자동(추천)", "간단", "일반", "상세"]
 
 # Excel 안에서 용법·용량 원문을 담는 시트. fill_dosage.py가 이 시트를 읽습니다.
+EXTRAS_VERSION = "2026-10-26d"  # app.py 사이드바에 함께 표시. app.py와 같이 올렸는지 확인용
+
 SOURCE_SHEET = "용법용량 원문"
 SOURCE_HEADERS = ["비교표 열 이름", "품목코드", "허가제품명", "효능효과 원문", "용법용량 원문", "비교표 시트"]
 SOURCE_KEYS = ["column", "id", "name", "indications_text", "dosage_text", "sheet"]
