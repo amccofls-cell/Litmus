@@ -242,7 +242,7 @@ def move_selected_items(delta):
 
 
 # ── 앱 입력용 파일로 품목 추가 (원내 비교 후보 추출 프로그램에서 만든 파일) ──
-APP_INPUT_COLUMNS = ["구분", "약품명", "성분명", "보험코드"]
+APP_INPUT_COLUMNS = ["구분", "약품명", "성분명", "보험코드"]  # 신청번호 열은 있으면 씁니다 (신청의약품별 비교표)
 STRENGTH_IN_NAME = re.compile(r"\d+(?:\.\d+)?\s*(?:마이크로그램|밀리그램|그램|밀리리터|mcg|μg|ug|mg|g|ml|mL|%)", re.IGNORECASE)
 
 
@@ -1199,6 +1199,47 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     return cached
 
 
+def _mask_key(text, key):
+    """화면에 보여 줄 글에서 인증키를 가립니다."""
+    text = str(text)
+    for value in {key, requests.utils.quote(key or "", safe="")}:
+        if value:
+            text = text.replace(value, "****")
+    return re.sub(r"(serviceKey=)[^&\s]+", r"\1****", text)
+
+
+def diagnose_mfds_detail(item_seq, service_key):
+    """식약처 상세 API 응답에서 효능효과(EE)·용법용량(UD)·주의사항(NB) 문서가 어떻게 오는지 요약합니다."""
+    lines = [f"주소: {MFDS_DETAIL_URL}", f"품목기준코드: {item_seq}"]
+    for response_type in ("json", "xml"):
+        lines.append(f"\n[type={response_type}]")
+        resp = None
+        try:
+            resp = requests.get(MFDS_DETAIL_URL, params={"serviceKey": service_key, "item_seq": item_seq, "type": response_type}, timeout=30)
+            lines.append(f"HTTP {resp.status_code} · {resp.headers.get('Content-Type', '')} · {len(resp.text):,}자")
+            items = _parse_response_items(resp, "MFDS 상세")
+        except Exception as exc:  # 점검 화면이라 어떤 오류든 그대로 보여 줍니다 (키는 가림).
+            lines.append(f"오류: {_mask_key(exc, service_key)}")
+            if resp is not None:
+                lines.append(f"응답 앞부분: {_mask_key(resp.text[:300], service_key)}")
+            continue
+        if not items:
+            lines.append(f"items 없음. 응답 앞부분: {_mask_key(resp.text[:300], service_key)}")
+            continue
+        item = items[0]
+        lines.append(f"받은 항목 {len(item)}개: {', '.join(list(item)[:40])}")
+        for field in ("EE_DOC_DATA", "UD_DOC_DATA", "NB_DOC_DATA"):
+            value = item.get(field)
+            if value is None:
+                lines.append(f"{field}: 항목 자체가 없음")
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            parsed = parse_nested_doc_xml(text)
+            lines.append(f"{field}: 형식 {type(value).__name__}, {len(text):,}자, 읽은 글 {len(parsed):,}자")
+            lines.append(f"  앞부분: {text[:200]!r}")
+    return "\n".join(lines)
+
+
 def current_kst_date():
     return datetime.now(KST).date().isoformat()
 
@@ -2068,6 +2109,16 @@ with st.sidebar:
                 cache_path.unlink()
         st.rerun()
     st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
+    with st.expander("🔧 식약처 상세정보 점검 (효능효과·용법용량이 빈칸일 때)"):
+        st.caption("품목기준코드 하나로 식약처 상세 API를 직접 불러, 효능효과·용법용량 문서가 오는지 보여 줍니다. 인증키는 화면에 나오지 않습니다.")
+        check_seq = st.text_input("품목기준코드", value="200700547", key="mfds_check_seq")
+        if st.button("점검하기", disabled=not mfds_key):
+            st.code(diagnose_mfds_detail(check_seq.strip(), mfds_key), language="text")
+        if st.button("상세정보 캐시 비우기"):
+            if CACHE_DETAIL_FILE.exists():
+                CACHE_DETAIL_FILE.unlink()
+            st.cache_resource.clear()
+            st.success("상세정보 캐시를 비웠습니다. 다음 조회 때 식약처에서 새로 받아옵니다.")
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
@@ -2136,13 +2187,28 @@ with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프�
         "나머지는 이름이나 성분이 같은 후보 중에서 직접 골라 주세요."
     )
     app_input_file = st.file_uploader("앱 입력용 파일 (xlsx)", type=["xlsx"], key="app_input_file")
-    replace_groups = st.checkbox("지금 고른 품목을 비우고 파일 내용으로 새로 채우기", value=True, key="app_input_replace")
-    if app_input_file and st.button("파일 읽고 품목 연결하기", disabled=not hira_key):
+    input_frame, number_choice = None, None
+    if app_input_file:
         input_frame = pd.read_excel(app_input_file, dtype=str).fillna("")
+        if "신청번호" in input_frame.columns and input_frame["신청번호"].str.strip().any():
+            # 신청번호마다 비교표를 하나씩 만듭니다: 고른 번호의 신청의약품과 그 비교약만 불러옵니다.
+            numbers = list(dict.fromkeys(n for n in input_frame["신청번호"].str.strip() if n))
+            names = {
+                n: ", ".join(input_frame[(input_frame["신청번호"].str.strip() == n) & (input_frame["구분"] == "신청의약품")]["약품명"].head(3))
+                for n in numbers
+            }
+            number_choice = st.selectbox(
+                "어느 신청의약품의 비교표를 만들까요? (신청번호를 바꿔 가며 하나씩 만드세요)",
+                numbers, format_func=lambda n: f"{n} · {names.get(n) or '(신청의약품 없음)'}", key="app_input_number",
+            )
+    replace_groups = st.checkbox("지금 고른 품목을 비우고 파일 내용으로 새로 채우기", value=True, key="app_input_replace")
+    if input_frame is not None and st.button("파일 읽고 품목 연결하기", disabled=not hira_key):
         missing_columns = [column for column in APP_INPUT_COLUMNS if column not in input_frame.columns]
         if missing_columns:
             st.error(f"앱 입력용 파일에 {', '.join(missing_columns)} 열이 없습니다.")
         else:
+            if number_choice:
+                input_frame = input_frame[input_frame["신청번호"].str.strip() == number_choice]
             with st.spinner("보험코드, 약품명, 성분명으로 품목을 찾는 중입니다…"):
                 st.session_state.file_links, link_errors = link_app_input(input_frame, normal_rows, mfds_key, hira_key)
             for link_error in link_errors:
