@@ -204,6 +204,119 @@ def _write_sheet(sheet, df, title, note_lines, index_label, highlight_applicant)
         sheet.cell(row=note_row + offset, column=1, value=line).font = s["note"]
 
 
+# ── 비교표 셀 병합 (비교표 예시 모음.pptx 양식) ─────────────────
+# - 같은 제품의 함량별 열은 맨 위 제품명 칸을 병합합니다.
+# - 각 행에서 이웃한 칸의 내용이 같으면 병합하고, 다르면 나눠 둡니다.
+#   같은 제품 안에서는 항상, 다른 제품끼리는 제품 경계가 딱 맞을 때만 병합합니다.
+# - 함량마다 값이 따로 있어야 하는 행과 사람이 채우는 행은 병합하지 않습니다.
+TABLE_HEADER_ROW = 3
+NO_MERGE_ROWS = {
+    "함량", "허가제품명", "영문제품명", "약가", "심평원제품코드", "약가적용시작일", "판매예정종료일", "원내코드",
+} | set(MANUAL_TAIL_COLUMNS)
+_STRENGTH_PATTERN = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:마이크로그램|밀리그램|그램|밀리리터|국제단위|단위|mcg|μg|mg|g|mL|ml|IU|%)"
+    r"(?:\s*/\s*\d*(?:\.\d+)?\s*(?:밀리리터|mL|ml))?"
+)
+
+
+def base_product_name(name):
+    """제품명에서 함량을 빼서 같은 제품인지 비교할 이름을 만듭니다. 예: 나르코설하정100마이크로그램 → 나르코설하정"""
+    return _clean(_STRENGTH_PATTERN.sub("", str(name or "")))
+
+
+def _table_rows(sheet):
+    """비교표 표 부분의 (행 번호, 항목 이름) 목록. 표 아래 빈 줄부터는 설명 문구입니다."""
+    rows, row = [], TABLE_HEADER_ROW + 1
+    while sheet.cell(row=row, column=1).value not in (None, ""):
+        rows.append((row, str(sheet.cell(row=row, column=1).value)))
+        row += 1
+    return rows
+
+
+def unmerge_table(sheet):
+    """표 안의 병합을 모두 풀고, 풀린 칸에 원래 값을 다시 채웁니다. (다시 병합하기 전에 씁니다)"""
+    last_row = TABLE_HEADER_ROW + len(_table_rows(sheet))
+    for merged in list(sheet.merged_cells.ranges):
+        if merged.min_row < TABLE_HEADER_ROW or merged.min_row > last_row:
+            continue
+        value = sheet.cell(row=merged.min_row, column=merged.min_col).value
+        sheet.unmerge_cells(str(merged))
+        for row in range(merged.min_row, merged.max_row + 1):
+            for col in range(merged.min_col, merged.max_col + 1):
+                sheet.cell(row=row, column=col).value = value
+
+
+def product_groups(sheet):
+    """열마다 어느 제품에 속하는지 정합니다. 같은 구분 + 같은 제품명(함량 제외)이면 한 제품입니다."""
+    labels = {label: row for row, label in _table_rows(sheet)}
+    name_row, group_row = labels.get("허가제품명"), labels.get("구분")
+    keys = []
+    for col in range(2, sheet.max_column + 1):
+        name = sheet.cell(row=name_row, column=col).value if name_row else sheet.cell(row=TABLE_HEADER_ROW, column=col).value
+        group = sheet.cell(row=group_row, column=col).value if group_row else ""
+        keys.append((_clean(group), base_product_name(name)))
+    return keys
+
+
+def _merge_run(sheet, row, start_col, end_col):
+    from openpyxl.styles import Alignment
+
+    if end_col > start_col:
+        sheet.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
+        sheet.cell(row=row, column=start_col).alignment = Alignment(wrap_text=True, vertical="top", horizontal="center")
+
+
+def apply_comparison_merges(sheet, cross_product=True):
+    """비교표 시트에 병합 규칙을 적용합니다. 여러 번 실행해도 결과가 같습니다."""
+    from openpyxl.styles import Font, PatternFill
+
+    unmerge_table(sheet)
+    keys = product_groups(sheet)
+    if not keys:
+        return
+    first_col = 2
+
+    # 맨 위 제품명 칸: 같은 제품의 함량별 열을 하나로 병합
+    col = first_col
+    while col < first_col + len(keys):
+        end = col
+        while end + 1 < first_col + len(keys) and keys[end + 1 - first_col] == keys[col - first_col]:
+            end += 1
+        group, name = keys[col - first_col]
+        header = sheet.cell(row=TABLE_HEADER_ROW, column=col)
+        header.value = f"{group} | {name}" if group else name
+        header.font = Font(bold=True)
+        if group == "신청의약품":
+            header.fill = PatternFill("solid", fgColor="FFF2CC")
+        _merge_run(sheet, TABLE_HEADER_ROW, col, end)
+        col = end + 1
+
+    # 각 항목 행: 이웃한 칸의 내용이 같으면 병합
+    starts = {first_col + i for i, key in enumerate(keys) if i == 0 or keys[i - 1] != key}
+    ends = {first_col + i for i, key in enumerate(keys) if i == len(keys) - 1 or keys[i + 1] != key}
+    for row, label in _table_rows(sheet):
+        if label in NO_MERGE_ROWS:
+            continue
+        values = [_clean(sheet.cell(row=row, column=c).value) for c in range(first_col, first_col + len(keys))]
+        i = 0
+        while i < len(values):
+            j = i
+            while j + 1 < len(values) and values[j + 1] == values[i]:
+                j += 1
+            if values[i]:
+                run_start, run_end = first_col + i, first_col + j
+                if cross_product and run_start in starts and run_end in ends:
+                    _merge_run(sheet, row, run_start, run_end)
+                else:
+                    # 제품 경계가 맞지 않으면 같은 제품 안에서만 병합
+                    sub_start = run_start
+                    for c in range(run_start, run_end + 1):
+                        if c == run_end or keys[c + 1 - first_col] != keys[c - first_col]:
+                            _merge_run(sheet, row, sub_start, c)
+                            sub_start = c + 1
+            i = j + 1
+
+
 def _write_source_sheet(sheet, dosage_sources):
     """용법·용량 원문 시트. 화면에서 어떤 버전을 골랐든 원문을 그대로 남깁니다."""
     s = _styles()
@@ -236,7 +349,9 @@ def to_excel_bytes(comparison_df=None, detail_df=None, title="의약품 비교�
         f"'{STATUS_FAILED}'는 API 호출이 실패한 칸, '{STATUS_EMPTY}'은 조회는 됐지만 내용이 없는 칸입니다.",
     ]
     if comparison_df is not None and len(comparison_df.columns):
-        _write_sheet(workbook.create_sheet("비교표"), comparison_df, title, notes, "항목", True)
+        comparison_sheet = workbook.create_sheet("비교표")
+        _write_sheet(comparison_sheet, comparison_df, title, notes, "항목", True)
+        apply_comparison_merges(comparison_sheet)
     if detail_df is not None and len(detail_df):
         detail_t = detail_df.set_index("허가제품명").T if "허가제품명" in detail_df.columns else detail_df
         _write_sheet(workbook.create_sheet("상세결과"), detail_t, f"{title} — 상세 결과", notes, "항목", False)
