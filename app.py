@@ -330,7 +330,8 @@ def link_app_input(frame, rows, mfds_key, hira_key):
         edi = next((code for code in (normalize_code_digits(v) for v in str(row.get("보험코드", "")).split()) if code), "")
         name = clean_whitespace(row.get("약품명", ""))
         ingredient = clean_whitespace(row.get("성분명", ""))
-        link = {"구분": clean_whitespace(row.get("구분", "")), "입력 약품명": name, "보험코드": edi,
+        link = {"신청번호": clean_whitespace(row.get("신청번호", "")), "구분": clean_whitespace(row.get("구분", "")),
+                "입력 약품명": name, "보험코드": edi,
                 "seq": "", "연결 품목": "", "방법": "", "후보": [], "후보 근거": ""}
         if edi and hira_key:
             try:
@@ -391,6 +392,56 @@ def apply_file_links(links, replace):
     st.session_state.group_mode = True
     st.session_state.group_mode_previous = True  # 그룹 모드로 바뀔 때 예전 조회 목록이 신청의약품으로 섞이지 않게 합니다.
     st.session_state.file_links = None
+
+
+ALL_NUMBERS = "__전체__"  # 앱 입력용 파일의 모든 신청번호를 한 번에 (신청번호별 시트)
+
+
+def picked_seq(link, index):
+    """자동 연결된 품목코드, 없으면 화면에서 고른 후보의 품목코드."""
+    if link["seq"]:
+        return link["seq"]
+    pick = st.session_state.get(f"link_pick_{index}", "")
+    return pick.rsplit(" · ", 1)[-1] if " · " in pick else ""
+
+
+def prepare_batch(links):
+    """신청번호별 묶음 조회 준비 (버튼 on_click용): [{신청번호, 구분, 품목코드}]를 저장합니다."""
+    st.session_state.batch_plan = [
+        {"number": link.get("신청번호", ""), "label": link["구분"], "seq": seq}
+        for index, link in enumerate(links) if (seq := picked_seq(link, index))
+    ]
+    st.session_state.batch_results = None
+    st.session_state.file_links = None
+
+
+def run_batch(plan, by_seq, mfds_key, hira_key, wanted_extras, as_of_date, include_all_fields):
+    """신청번호마다 따로 조회합니다. 같은 약이 여러 신청번호의 비교약이어도 신청번호마다 들어갑니다."""
+    results = []
+    numbers = list(dict.fromkeys(item["number"] for item in plan))
+    for number in numbers:
+        items = [item for item in plan if item["number"] == number and item["seq"] in by_seq]
+        items = list({item["seq"]: item for item in items}.values())  # 한 신청번호 안에서 같은 품목은 한 번
+        if not items:
+            continue
+        group_lookup = {}
+        for item in items:
+            parsed = parse_strength(by_seq[item["seq"]].get("ITEM_NAME", ""))
+            group_lookup[item["seq"]] = {"group_id": item["label"], "group_label": item["label"], "seq": item["seq"],
+                                         "strength": parsed, "parsed_strength": parsed}
+        st.caption(f"{number} 조회 중…")
+        result_df, errors, reference = lookup_selected(
+            [by_seq[item["seq"]] for item in items], mfds_key, hira_key, wanted_extras, as_of_date, group_lookup,
+            include_all_fields=include_all_fields,
+        )
+        applicants = [clean_whitespace(by_seq[item["seq"]].get("ITEM_NAME", "")) for item in items if item["label"] == "신청의약품"]
+        results.append({
+            "number": number, "name": cx.base_product_name(applicants[0]) if applicants else "", "result": result_df,
+            "errors": errors, "reference": reference,
+            "dosage": cx.build_dosage_summaries(dosage_products(reference)),
+            "seqs": [str(product["mfds"]["item_seq"]) for product in reference["products"]],
+        })
+    return results
 
 
 def build_group_items(by_seq):
@@ -1531,14 +1582,15 @@ def order_result_columns(df):
     return df[ordered + tail]
 
 
-def apply_dosage_version(df, choice):
+def apply_dosage_version(df, choice, summaries=None, seqs=None):
     """용법용량 열을 고른 버전(간단/일반/상세)으로 바꾸고 열 이름을 '용법용량 (일반)'처럼 바꿉니다.
-    행 순서는 조회 순서와 같아야 하므로, 정렬하기 전의 조회 결과에 적용합니다."""
-    summaries = st.session_state.get("last_dosage")
+    행 순서는 조회 순서와 같아야 하므로, 정렬하기 전의 조회 결과에 적용합니다.
+    summaries·seqs를 주지 않으면 마지막 조회 결과의 것을 씁니다 (신청번호별 묶음은 묶음마다 줍니다)."""
+    summaries = st.session_state.get("last_dosage") if summaries is None else summaries
     level = cx.resolve_dosage_choice(choice, summaries)
     if level == "원문" or "용법용량" not in df.columns:
         return df, "원문"
-    seqs = st.session_state.get("last_seqs", [])
+    seqs = st.session_state.get("last_seqs", []) if seqs is None else seqs
     applied = df.copy()
     applied["용법용량"] = [
         cx.dosage_cell(
@@ -2220,7 +2272,7 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
-APP_VERSION = "2026-10-26c · 식약처 PDF 문서 대응"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
+APP_VERSION = "2026-10-26d · 신청번호별 시트"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
 
 with st.sidebar:
     st.header("환경 설정")
@@ -2355,8 +2407,10 @@ with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프�
                 for n in numbers
             }
             number_choice = st.selectbox(
-                "어느 신청의약품의 비교표를 만들까요? (신청번호를 바꿔 가며 하나씩 만드세요)",
-                numbers, format_func=lambda n: f"{n} · {names.get(n) or '(신청의약품 없음)'}", key="app_input_number",
+                "어느 신청의약품의 비교표를 만들까요?",
+                [ALL_NUMBERS] + numbers, key="app_input_number",
+                format_func=lambda n: (f"전체 {len(numbers)}개 · 신청번호별로 시트를 나눠 한 번에 만들기" if n == ALL_NUMBERS
+                                       else f"{n} · {names.get(n) or '(신청의약품 없음)'}"),
             )
     replace_groups = st.checkbox("지금 고른 품목을 비우고 파일 내용으로 새로 채우기", value=True, key="app_input_replace")
     if input_frame is not None and st.button("파일 읽고 품목 연결하기", disabled=not hira_key):
@@ -2364,8 +2418,9 @@ with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프�
         if missing_columns:
             st.error(f"앱 입력용 파일에 {', '.join(missing_columns)} 열이 없습니다.")
         else:
-            if number_choice:
+            if number_choice and number_choice != ALL_NUMBERS:
                 input_frame = input_frame[input_frame["신청번호"].str.strip() == number_choice]
+            st.session_state.file_links_all = number_choice == ALL_NUMBERS
             with st.spinner("보험코드, 약품명, 성분명으로 품목을 찾는 중입니다…"):
                 st.session_state.file_links, link_errors = link_app_input(input_frame, normal_rows, mfds_key, hira_key)
             for link_error in link_errors:
@@ -2375,7 +2430,8 @@ with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프�
         auto_count = sum(1 for link in file_links if link["seq"])
         st.markdown(f"**자동 연결 {auto_count}건 / 직접 확인 {len(file_links) - auto_count}건**")
         for index, link in enumerate(file_links):
-            label = f"{link['구분']} · {link['입력 약품명']}" + (f" (보험코드 {link['보험코드']})" if link["보험코드"] else "")
+            label = (f"[{link['신청번호']}] " if link.get("신청번호") else "") + f"{link['구분']} · {link['입력 약품명']}" + (
+                f" (보험코드 {link['보험코드']})" if link["보험코드"] else "")
             if link["seq"]:
                 st.markdown(f"✅ {label} → **{link['연결 품목']}** · {link['방법']}")
             else:
@@ -2385,7 +2441,11 @@ with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프�
                                        else "찾지 못했습니다. 검색에서 직접 추가해 주세요"),
                     choices, key=f"link_pick_{index}",
                 )
-        st.button("그룹에 추가", type="primary", on_click=apply_file_links, args=(file_links, replace_groups))
+        if st.session_state.get("file_links_all"):
+            st.button("신청번호별 묶음으로 준비", type="primary", on_click=prepare_batch, args=(file_links,),
+                      help="아래 '3. 조회 설정'의 '신청번호별 묶음 조회'로 모든 신청번호를 한 번에 조회합니다.")
+        else:
+            st.button("그룹에 추가", type="primary", on_click=apply_file_links, args=(file_links, replace_groups))
 
 query = st.text_input(
     "의약품명 · 제약사명 · 성분명 · 주성분 영문명",
@@ -2592,6 +2652,27 @@ applicant_ready = not group_mode or bool(st.session_state.groups["applicant"]["s
 if group_mode and not applicant_ready and selected_seqs:
     st.warning("조회하려면 신청의약품 그룹에 품목을 하나 이상 추가하세요.")
 
+batch_plan = st.session_state.get("batch_plan")
+if batch_plan:
+    with st.container(border=True):
+        plan_numbers = list(dict.fromkeys(item["number"] for item in batch_plan))
+        st.markdown(f"**신청번호별 묶음 준비됨**: 신청번호 {len(plan_numbers)}개 · 품목 {len(batch_plan)}건 ({', '.join(plan_numbers)})")
+        batch_col, cancel_col = st.columns([3, 1])
+        with batch_col:
+            run_clicked = st.button(f"신청번호별 묶음 조회 ({len(plan_numbers)}개)", type="primary", disabled=not (mfds_key and hira_key))
+        with cancel_col:
+            if st.button("묶음 취소"):
+                st.session_state.batch_plan = None
+                st.session_state.batch_results = None
+                st.rerun()
+        if run_clicked:
+            with st.spinner("신청번호마다 식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
+                st.session_state.batch_results = run_batch(
+                    batch_plan, by_seq, mfds_key, hira_key, selected_extras, price_reference_date,
+                    include_all_fields=bool(st.session_state.get("preset_all_fields", False)),
+                )
+            st.rerun()
+
 lookup_button_label = "그룹 전체 품목 조회" if group_mode else "선택한 품목 조회"
 if st.button(lookup_button_label, type="primary", disabled=not selected_seqs or not applicant_ready or not (mfds_key and hira_key)):
     group_lookup = None
@@ -2610,6 +2691,41 @@ if st.button(lookup_button_label, type="primary", disabled=not selected_seqs or 
     st.session_state.last_dosage = cx.build_dosage_summaries(dosage_products(reference_bundle))
     st.session_state.last_seqs = [str(product["mfds"]["item_seq"]) for product in reference_bundle["products"]]
     st.rerun()
+
+batch_results = st.session_state.get("batch_results")
+if batch_results:
+    section_header("4", "신청번호별 묶음 결과")
+    batch_parts, batch_level = [], "원문"
+    for item in batch_results:
+        applied, batch_level = apply_dosage_version(item["result"], dosage_choice, item["dosage"], item["seqs"])
+        shown = make_summary_df(applied) if summary_view else applied
+        batch_parts.append({
+            "number": item["number"], "name": item["name"],
+            "comparison": make_comparison_df(apply_text_layout(shown)),
+            "detail": make_display_df(applied, summary_view=summary_view, transpose_view=False),
+            "sources": dosage_sources(item["result"], item["reference"]),
+        })
+    batch_date = (batch_results[0]["reference"] or {}).get("reference_date", "")
+    st.download_button(
+        "비교표 Excel 다운로드 (신청번호별 시트)",
+        data=cx.to_excel_bytes_by_number(
+            batch_parts, title="의약품 비교표",
+            note_lines=[f"약가 기준일: {batch_date}",
+                        f"용법·용량: {'원문' if batch_level == '원문' else batch_level + ' 버전'} — 약사 확인 필요"],
+        ),
+        file_name=f"의약품비교표_신청번호별_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    st.caption("시트 '신청1'에 신청의약품1과 그 비교약, '신청2'에 신청의약품2와 그 비교약 … 상세결과와 용법용량 원문은 한 시트에 모았습니다.")
+    for tab, part in zip(st.tabs([f"{part['number']} {part['name']}" for part in batch_parts]), batch_parts):
+        with tab:
+            render_resizable_wrapped_table(part["comparison"], show_index=True, height=640, table_key=f"batch_{part['number']}")
+    batch_errors = [f"[{item['number']}] {error}" for item in batch_results for error in item["errors"]]
+    if batch_errors:
+        with st.expander(f"API 경고/오류 {len(batch_errors)}건"):
+            for error in batch_errors:
+                st.warning(error)
 
 if st.session_state.last_result is not None:
     section_header("4", "조회 결과")
