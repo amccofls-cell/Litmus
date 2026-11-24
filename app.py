@@ -4,7 +4,11 @@ import json
 import os
 import re
 import time
+import traceback
+from urllib.parse import quote, quote_plus
 import html as html_lib
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -24,17 +28,34 @@ import comparison_extras as cx
 MFDS_LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 MFDS_DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
 HIRA_PRICE_URL = "https://apis.data.go.kr/B551182/dgamtCrtrInfoService1.2/getDgamtList"
+# 심평원 의약품성분약효정보조회서비스: 일반명코드/약효분류번호로 분류명·일반명·함량내용·단위를 조회합니다.
+# 식약처 의약품 낱알식별 정보: 품목코드(item_seq)로 분류번호(CLASS_NO)·분류명(CLASS_NAME)을 조회합니다.
+# 비급여 약의 약효분류를 채울 때 씁니다. 정제·캡슐 등 낱알 의약품만 들어 있습니다.
+# 오퍼레이션 버전이 바뀌어도 동작하도록 후보 주소를 차례로 시도합니다. 정확한 주소를 알면 맨 앞에 넣으세요.
+MFDS_PILL_URLS = [
+    "https://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService03/getMdcinGrnIdntfcInfoList03",
+    "https://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService02/getMdcinGrnIdntfcInfoList02",
+    "https://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService01/getMdcinGrnIdntfcInfoList01",
+]
+HIRA_CMPN_URL = "https://apis.data.go.kr/B551182/msupCmpnMeftInfoService/getMajorCmpnNmCdList"
 
 FIELD_BAR_CODE = "BAR_CODE"
 LIST_NUM_OF_ROWS = 500
+# 허가목록 페이지를 동시에 받는 개수. 너무 크게 하면 공공데이터포털에서 오류(과다 요청)가 날 수 있습니다.
+LIST_FETCH_WORKERS = 4
+# 수집 중 임시 파일에 진행 상황을 저장하는 간격(페이지 수)
+LIST_TEMP_SAVE_EVERY = 20
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
 LIST_CSV_FIELDS = [
     "ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE",
     "MAIN_ITEM_INGR", "MAIN_INGR_ENG",
 ]  # 바코드는 상세 API에서만 확인 가능
-BASE_COLUMNS = ["허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
+BASE_COLUMNS = ["허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "분류명", "일반명", "함량내용", "단위", "주성분영문명", "성분명", "효능효과", "용법용량"]
 HIRA_MEFT_FIELD = "meftDivNo"
+HIRA_GNL_CODE_FIELD = "gnlNmCd"
+# getMajorCmpnNmCdList 응답 필드 → 결과 열 이름
+HIRA_CMPN_FIELDS = {"divNm": "분류명", "gnlNm": "일반명", "iqtyTxt": "함량내용", "unit": "단위"}
 
 # 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
 # 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
@@ -47,7 +68,11 @@ EXTRA_FIELD_SPECS = {
     "원료약품및분량": {"label": "원료약품 및 분량", "source": "MATERIAL_NAME", "transform": "direct"},
     "소아_고령자투여": {"label": "소아·고령자 투여", "source": "NB_DOC_DATA", "keywords": ["소아에 대한 투여", "소아투여", "고령자에 대한 투여", "고령자투여"], "transform": "section"},
     "임부_수유부투여": {"label": "임부 및 수유부 투여", "source": "NB_DOC_DATA", "keywords": ["임부 및 수유부에 대한 투여", "임부, 수유부, 가임여성 및 남성에 대한 투여", "가임여성 및 남성에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"], "transform": "section"},
-    "금기사항": {"label": "금기사항", "source": "NB_DOC_DATA", "keywords": ["다음 환자에게는 투여하지 말 것", "투여하지 말 것", "금기"], "transform": "section"},
+    "금기사항": {"label": "금기사항", "source": "NB_DOC_DATA", "keywords": ["다음 환자에게는 투여하지 말 것", "투여하지 말 것", "금기",
+                 # 일반의약품: "다음과 같은 사람은 이 약을 복용(사용)하지 말 것"
+                 "복용하지 말 것", "사용하지 말 것", "복용하지 마십시오", "사용하지 마십시오",
+                 # "!"로 시작하면 제외 단어: "이 약을 복용하는 동안 다음의 약을 복용하지 말 것"(상호작용)이 섞이지 않게
+                 "!동안"], "transform": "section"},
     "신중투여": {"label": "신중히 투여할 환자", "source": "NB_DOC_DATA", "keywords": ["다음 환자에는 신중히 투여할 것", "신중히 투여"], "transform": "section"},
     "일반적주의": {"label": "일반적 주의", "source": "NB_DOC_DATA", "keywords": ["일반적 주의"], "transform": "section"},
     "상호작용": {"label": "상호작용", "source": "NB_DOC_DATA", "keywords": ["상호작용"], "transform": "section"},
@@ -58,7 +83,9 @@ EXTRA_FIELD_SPECS = {
     "포장단위": {"label": "포장단위", "source": "PACK_UNIT", "transform": "direct"},
     "유효기간": {"label": "유효기간", "source": "VALID_TERM", "transform": "direct"},
     "보관정보": {"label": "보관정보", "source": "STORAGE_METHOD", "transform": "direct"},
-    "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항"], "transform": "section"},
+    "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항",
+                 # 일반의약품: "저장상의 주의사항"
+                 "저장상의 주의"], "transform": "section"},
     "성상": {"label": "성상", "source": "CHART", "transform": "direct"},
     "변경내용": {"label": "변경내용", "source": "GBN_NAME", "transform": "direct"},
     "변경일자": {"label": "변경일자", "source": "CHANGE_DATE", "transform": "direct"},
@@ -83,7 +110,7 @@ NEW_DRUG_PRESET_KEYS = [
     "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
 ]
 ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "희귀의약품"]
-RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "원내코드", "제약사한글명", "희귀의약품", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
+RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "원내코드", "제약사한글명", "희귀의약품", "약가", "약효분류", "분류명", "일반명", "함량내용", "단위", "분류출처", "성분출처", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 MFDS_RAW_EXCLUDED_FIELDS = {
@@ -108,9 +135,32 @@ TEMP_FILE = DATA_DIR / "허가목록_임시.json"
 CACHE_CODE_FILE = DATA_DIR / "cache_약가_코드별.json"
 CACHE_NAME_FILE = DATA_DIR / "cache_약가_이름별.json"
 CACHE_DETAIL_FILE = DATA_DIR / "cache_상세정보.json"
+# 검색 인덱스용 경량 캐시 {품목코드: [성분명, 주성분영문명]}. 큰 상세정보 캐시를 검색할 때마다 다시 읽지 않도록 분리했습니다.
+CACHE_SEARCH_LIGHT_FILE = DATA_DIR / "cache_검색보조.json"
 CACHE_MEFT_FILE = DATA_DIR / "cache_약효분류.json"
+CACHE_CMPN_FILE = DATA_DIR / "cache_성분약효.json"
+CACHE_PILL_FILE = DATA_DIR / "cache_낱알분류.json"
 LIST_META_FILE = DATA_DIR / "허가목록_메타.json"
+# 심평원 「DUR 점검 비급여 의약품 목록」(요양기관업무포털 biz.hira.or.kr에서 내려받는 엑셀).
+# 저장소의 이 폴더에 넣어 두면, 파일 이름이 가장 뒤인(날짜가 가장 최근인) 파일을 씁니다.
+NONPAY_LIST_DIR = Path(__file__).resolve().parent / "data" / "비급여목록"
 KST = timezone(timedelta(hours=9))
+
+
+# 요청 주소에 들어간 인증키(serviceKey=…)가 오류 문구에 그대로 찍히므로, 화면·JSON에 내보내기 전에 가립니다.
+SERVICE_KEY_PATTERN = re.compile(r"(service_?key=)[^&\s'\"<>]+", re.IGNORECASE)
+
+
+def mask_secrets(text, *secrets):
+    """오류 문구에서 serviceKey 값과, 넘겨받은 인증키(원문·URL 인코딩 형태)를 '***'로 바꿉니다."""
+    masked = SERVICE_KEY_PATTERN.sub(r"\1***", str(text))
+    for secret in secrets:
+        secret = str(secret or "")
+        if len(secret) < 8:
+            continue
+        for form in {secret, quote(secret, safe=""), quote_plus(secret, safe="")}:
+            masked = masked.replace(form, "***")
+    return masked
 
 
 def clean_whitespace(text):
@@ -282,6 +332,49 @@ SALT_WORDS_EN = [
 ]
 
 
+STRENGTH_UNITS = {"마이크로그램": "mcg", "마이크로그람": "mcg", "μg": "mcg", "ug": "mcg", "mcg": "mcg",
+                  "밀리그램": "mg", "밀리그람": "mg", "mg": "mg", "그램": "g", "그람": "g", "g": "g",
+                  "밀리리터": "ml", "ml": "ml", "리터": "l", "l": "l", "%": "%", "퍼센트": "%",
+                  "iu": "iu", "국제단위": "iu", "단위": "u", "u": "u"}
+STRENGTH_PART = re.compile(
+    r"(\d+(?:\.\d+)?(?:\s*/\s*\d+(?:\.\d+)?)*)\s*(" + "|".join(sorted(map(re.escape, STRENGTH_UNITS), key=len, reverse=True)) + r")(?![a-z가-힣])",
+    re.IGNORECASE)
+
+
+def name_strength_key(name):
+    """제품명을 (제품 이름, 함량들)로 바꿔 표기 차이를 없앱니다. 함량이 같은지는 숫자와 단위로만 봅니다.
+
+    예: '아토젯 정 10/10mg [1TAB]', '아토젯정10/10밀리그램' → ('아토젯정', (('10/10', 'mg'),))
+        '리피토 정 [10mg]', '리피토정10밀리그램(아토르바스타틴칼슘삼수화물)' → ('리피토정', (('10', 'mg'),))
+    괄호 속 성분명(식약처 이름)은 빼고, 괄호 속 함량([10mg])은 씁니다.
+    """
+    text = re.sub(r"_\(.*?\)\s*$", "", clean_whitespace(name))
+    # 괄호 안이 함량이면 살리고(괄호만 지움), 성분명·포장 단위면 통째로 뺍니다.
+    text = re.sub(r"[\(\[]([^\)\]]*)[\)\]]",
+                  lambda m: f" {m.group(1)} " if STRENGTH_PART.fullmatch(m.group(1).strip()) else " ", text)
+    strengths = tuple(sorted(
+        (re.sub(r"\s+", "", re.sub(r"\.0+(?=\D|$)", "", amount)), STRENGTH_UNITS[unit.lower()])
+        for amount, unit in STRENGTH_PART.findall(text)))
+    base = re.sub(r"[\s·,/\-]", "", STRENGTH_PART.sub(" ", text)).casefold()
+    return base, strengths
+
+
+def name_strength_index(rows):
+    index = {}
+    for row in rows:
+        index.setdefault(name_strength_key(row.get("ITEM_NAME", "")), []).append(row)
+    return index
+
+
+def same_ingredient(row, ingredient):
+    """입력 성분명과 식약처 품목 성분이 같은지. 어느 한쪽 성분을 모르면 None(판단 못 함)."""
+    wanted = ingredient_keys(ingredient)
+    have = [keys for keys in (ingredient_keys(row.get("MAIN_ITEM_INGR", "")), ingredient_keys(row.get("MAIN_INGR_ENG", ""))) if keys]
+    if not wanted or not have:
+        return None
+    return any(keys == wanted for keys in have)
+
+
 def ingredient_keys(text):
     """성분명을 비교용 성분 묶음으로 바꿉니다. 예: '펜타닐시트르산염' → {'펜타닐'}, 'Oxycodone HCl/Naloxone' → {'oxycodone', 'naloxone'}"""
     keys = set()
@@ -318,16 +411,22 @@ def link_app_input(frame, rows, mfds_key, hira_key):
 
     찾는 순서: EDI(보험)코드 → 한글 약품명 → 성분명
     1) 보험코드 → 심평원 제품명 → 같은 이름의 식약처 품목 → 바코드 4~11번째 = 보험코드 앞 8자리면 자동 연결
+       (Excel이 앞자리 0을 지워 8자리가 된 보험코드는 9자리로 되돌려 찾음)
     2) 식약처 제품명과 완전히 같으면 자동 연결
-    3) 나머지는 후보를 보여 주고 약사가 고름: 보험코드로 찾은 품목 → 이름이 들어간 품목 → 성분이 같은 품목 순
+    3) 띄어쓰기·단위 표기·괄호만 다르고 제품 이름과 함량(숫자·단위)이 정확히 같은 품목이 하나뿐이면 자동 연결
+       (예: '아토젯 정 10/10mg [1TAB]' = '아토젯정10/10밀리그램'). 성분명이 있으면 성분도 같아야 함
+    4) 나머지는 후보를 보여 주고 약사가 고름: 보험코드로 찾은 품목 → 이름이 들어간 품목 → 성분이 같은 품목 순
     """
     name_index = product_name_index(rows)
+    key_index = None  # 표기를 정리한 이름·함량으로 찾을 일이 생길 때 한 번만 만듭니다
     by_ingredient = None  # 성분으로 찾을 일이 생길 때 한 번만 만듭니다
     cache_detail = load_json_cache(CACHE_DETAIL_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors, links = [], []
     for _, row in frame.iterrows():
         edi = next((code for code in (normalize_code_digits(v) for v in str(row.get("보험코드", "")).split()) if code), "")
+        if 7 <= len(edi) < 9:  # 보험코드는 9자리. Excel이 숫자로 바꾸며 앞자리 0을 지운 경우
+            edi = edi.zfill(9)
         name = clean_whitespace(row.get("약품명", ""))
         ingredient = clean_whitespace(row.get("성분명", ""))
         link = {"신청번호": clean_whitespace(row.get("신청번호", "")), "구분": clean_whitespace(row.get("구분", "")),
@@ -352,9 +451,20 @@ def link_app_input(frame, rows, mfds_key, hira_key):
                     link.update(후보=matches, **{"후보 근거": "보험코드"})
         if not link["seq"]:
             matches = name_index.get(normalize_product_name(name), [])
+            if len(matches) != 1:
+                key_index = key_index if key_index is not None else name_strength_index(rows)
+                same = key_index.get(name_strength_key(name), []) if name_strength_key(name)[0] else []
+                if ingredient:  # 성분이 다르다고 확인된 품목은 뺍니다
+                    same = [r for r in same if same_ingredient(r, ingredient) is not False]
+                if len(same) == 1:
+                    checked = same_ingredient(same[0], ingredient) if ingredient else None
+                    link.update(seq=same[0]["ITEM_SEQ"],
+                                방법="제품명·함량 일치 (띄어쓰기·단위 표기 정리)" + (" + 성분 확인" if checked else ""))
+                elif same and not link["후보"]:
+                    link.update(후보=same, **{"후보 근거": "제품명·함량 일치 품목이 여러 개"})
             if len(matches) == 1:
                 link.update(seq=matches[0]["ITEM_SEQ"], 방법="식약처 제품명 완전일치")
-            elif not link["후보"]:
+            elif not link["seq"] and not link["후보"]:
                 candidates, basis = matches or name_candidates(rows, name), "약품명"
                 if not candidates and ingredient:
                     by_ingredient = by_ingredient if by_ingredient is not None else ingredient_index(rows)
@@ -558,6 +668,26 @@ def normalize_section_title(text):
     return text
 
 
+# PDF 글에서 소제목 경계만 알아보기 위한 일반의약품 소제목 표현입니다. 어느 결과 항목에도 들어가지 않습니다.
+# (소제목 번호가 1, 2, 3… 차례로 이어져야 인정하므로, 중간 소제목을 못 알아보면 그 뒤 소제목도 놓칩니다.)
+SECTION_HEADING_HINTS = [
+    "복용하기 전에", "사용하기 전에", "즉각 중지", "즉시 중지", "동안 다음의 약", "주의할 사항",
+]
+
+
+def split_keywords(keywords):
+    """찾는 말 목록을 (찾을 말, 뺄 말)로 나눕니다. "!"로 시작하는 말은 그 말이 든 소제목을 빼라는 뜻입니다."""
+    include = [normalize_section_title(k) for k in keywords if k and not k.startswith("!")]
+    exclude = [normalize_section_title(k[1:]) for k in keywords if k and k.startswith("!")]
+    return [k for k in include if k], [k for k in exclude if k]
+
+
+def heading_matches(normalized_heading, include, exclude):
+    if any(word in normalized_heading for word in exclude):
+        return False
+    return any(keyword in normalized_heading or normalized_heading in keyword for keyword in include)
+
+
 def parse_doc_sections(xml_str, keywords):
     """중첩 XML에서 title에 특정 키워드가 포함된 상위 항목과 하위 내용 추출."""
     if not xml_str or not xml_str.strip():
@@ -566,7 +696,7 @@ def parse_doc_sections(xml_str, keywords):
         root = ET.fromstring(xml_str.strip())
     except ET.ParseError:
         return ""
-    normalized_keywords = [normalize_section_title(keyword) for keyword in keywords if keyword]
+    normalized_keywords, excluded_keywords = split_keywords(keywords)
     chunks = []
     for el in root.iter():
         title = el.get("title")
@@ -580,13 +710,14 @@ def parse_doc_sections(xml_str, keywords):
         for n, idx in enumerate(heading_idx):
             heading_text = chunks[idx][1]
             normalized_heading = normalize_section_title(heading_text)
-            if any(keyword in normalized_heading or normalized_heading in keyword for keyword in normalized_keywords):
+            if heading_matches(normalized_heading, normalized_keywords, excluded_keywords):
                 end = heading_idx[n + 1] if n + 1 < len(heading_idx) else len(chunks)
                 picked.extend(text for _, text in chunks[idx:end])
     else:
         picked.extend(
             text for _, text in chunks
             if any(keyword in normalize_section_title(text) for keyword in normalized_keywords)
+            and not any(word in normalize_section_title(text) for word in excluded_keywords)
         )
     return clean_markup(" ".join(picked))
 
@@ -600,7 +731,8 @@ def parse_text_sections(text, keywords):
     lines = [line for line in str(text or "").splitlines() if line.strip()]
     if not lines:
         return ""
-    known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words} | {"경고"}
+    known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words if not k.startswith("!")} | {"경고"}
+    known |= {normalize_section_title(k) for k in SECTION_HEADING_HINTS}
     headings, last = [], 0
     for index, line in enumerate(lines):
         match = re.match(r"\s*(\d{1,2})\s*\.\s*(?=[가-힣])", line)
@@ -610,10 +742,10 @@ def parse_text_sections(text, keywords):
         if int(match.group(1)) == last + 1 and any(word in title for word in known if word):
             headings.append((index, title))
             last = int(match.group(1))
-    wanted = [normalize_section_title(k) for k in keywords if k]
+    wanted, unwanted = split_keywords(keywords)
     picked = []
     for n, (index, title) in enumerate(headings):
-        if any(word in title for word in wanted if word):
+        if any(word in title for word in wanted) and not any(word in title for word in unwanted):
             end = headings[n + 1][0] if n + 1 < len(headings) else len(lines)
             picked.append(join_wrapped_lines(lines[index:end]))
     return clean_whitespace(" ".join(picked))
@@ -676,7 +808,7 @@ def make_summary_df(result_df):
         # 간단/일반/상세로 바꾼 용법용량 열("용법용량 (일반)" 등)은 이미 요약본이므로 다시 자르지 않습니다.
         if str(column).startswith("용법용량") or column in cx.MANUAL_COLUMNS:
             continue
-        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
+        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "분류명", "일반명", "함량내용", "단위", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
     return summary_df
 
@@ -782,7 +914,8 @@ def load_json_cache(path):
 def save_json_cache(path, data):
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+        # 캐시 파일은 사람이 읽을 일이 거의 없으므로 들여쓰기 없이 저장해 쓰기·읽기 시간을 줄입니다.
+        json.dump(data, file, ensure_ascii=False, separators=(",", ":"))
     tmp.replace(path)
 
 
@@ -1190,12 +1323,24 @@ def price_line_label(item, all_items):
     return f"{code} ({hint})" if hint else code
 
 
+def price_spec_hint(item):
+    """약가 한 건의 포장·규격: 심평원 포장·규격 필드 + 제품명 끝 '_(10g)' 같은 규격. 없으면 빈 값."""
+    hint = hira_package_hint(item)
+    suffix = re.search(r"_\((.*?)\)\s*$", clean_whitespace((item or {}).get("itmNm", "")))
+    if suffix and suffix.group(1) and suffix.group(1) not in hint:
+        hint = f"{hint} {suffix.group(1)}".strip()
+    return hint
+
+
 def format_price_cell(price_items):
-    """약가 1건이면 기존과 같은 '1,309원', 여러 건이면 포장(제품코드)별로 줄을 나눠 모두 표시합니다."""
+    """약가 1건이면 '1,309원 (10g/튜브)'처럼 포장·규격을 괄호로 붙이고(없으면 가격만),
+    여러 건이면 포장(제품코드)별로 줄을 나눠 '제품코드 (포장·규격): 가격'으로 모두 표시합니다."""
     if not price_items:
         return ""
     if len(price_items) == 1:
-        return format_price(price_items[0].get("mxCprc", ""))
+        price = format_price(price_items[0].get("mxCprc", ""))
+        hint = price_spec_hint(price_items[0])
+        return f"{price} ({hint})" if price and hint else price
     return "\n".join(
         f"{price_line_label(item, price_items)}: {format_price(item.get('mxCprc', ''))}"
         for item in price_items
@@ -1208,24 +1353,34 @@ def join_hira_field(price_items, key):
 
 
 def get_effect_classification(item_name, bar_code, service_key, call_counter, cache_meft, errors):
-    """심평원 응답의 meftDivNo를 항상 조회해 약효분류로 반환합니다."""
+    """심평원 약가 응답에서 약효분류번호(meftDivNo)와 일반명코드(gnlNmCd)를 함께 반환합니다.
+
+    반환값: {"meftDivNo": "...", "gnlNmCd": "..."}
+    """
     key8 = barcode_key8(bar_code)
     cache_key = f"mdsCd:{key8}" if key8 else f"itmNm:{re.sub(r'_\(.*?\)\s*$', '', item_name or '').strip()}"
-    if cache_key in cache_meft:
-        return cache_meft[cache_key]
+    cached = cache_meft.get(cache_key)
+    # 이전 버전 캐시는 약효분류번호 문자열만 저장했으므로, 일반명코드를 얻기 위해 다시 조회합니다.
+    if isinstance(cached, dict):
+        return cached
+    empty = {HIRA_MEFT_FIELD: cached if isinstance(cached, str) else "", HIRA_GNL_CODE_FIELD: ""}
     if call_counter["hira"] >= HIRA_CALL_LIMIT:
-        return ""
+        return empty
     call_counter["hira"] += 1
     try:
         params = {"mdsCd": key8} if key8 else {"itmNm": re.sub(r"_\(.*?\)\s*$", "", item_name or "").strip()}
         items = hira_get(service_key, params)
     except (requests.RequestException, ValueError) as exc:
         errors.append(f"HIRA 약효분류 {cache_key}: {exc}")
-        return ""
+        return empty
     valid = [item for item in items if item.get("payTpNm") != "삭제"]
     if key8:
         valid = [item for item in valid if mdscd_key8(item.get("mdsCd")) == key8] or valid
-    value = clean_whitespace(valid[0].get(HIRA_MEFT_FIELD, "")) if valid else ""
+    first = valid[0] if valid else {}
+    value = {
+        HIRA_MEFT_FIELD: clean_whitespace(first.get(HIRA_MEFT_FIELD, "")),
+        HIRA_GNL_CODE_FIELD: clean_whitespace(first.get(HIRA_GNL_CODE_FIELD, "")),
+    }
     cache_meft[cache_key] = value
     return value
 
@@ -1298,6 +1453,392 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else doc_section(cached, EXTRA_FIELD_KEYWORDS[key])
     cache_detail[item_seq] = cached
     return cached
+
+
+def hira_cmpn_get(service_key, params):
+    query = {"serviceKey": service_key, "numOfRows": 100, "pageNo": 1}
+    query.update(params)
+    return _parse_response_items(requests.get(HIRA_CMPN_URL, params=query, timeout=30), "HIRA 성분약효")
+
+
+def get_component_info(meft_div_no, gnl_nm_cd, service_key, call_counter, cache_cmpn, errors):
+    """의약품성분약효정보조회서비스로 분류명·일반명·함량내용·단위를 조회합니다.
+
+    - 일반명코드(gnlNmCd)가 있으면 그 코드로 조회해 네 항목을 모두 채웁니다.
+    - 일반명코드가 없으면 약효분류번호(meftDivNo)로 조회해 분류명만 채웁니다.
+      (약효분류번호만으로는 같은 분류의 모든 성분이 나오므로 일반명·함량은 확정하지 않습니다.)
+    """
+    result = {column: "" for column in HIRA_CMPN_FIELDS.values()}
+    gnl_nm_cd = clean_whitespace(gnl_nm_cd)
+    meft_div_no = clean_whitespace(meft_div_no)
+    if gnl_nm_cd:
+        cache_key, params = f"gnlNmCd:{gnl_nm_cd}", {"gnlNmCd": gnl_nm_cd}
+    elif meft_div_no:
+        cache_key, params = f"meftDivNo:{meft_div_no}", {"meftDivNo": meft_div_no}
+    else:
+        return result
+    if cache_key in cache_cmpn:
+        return dict(cache_cmpn[cache_key])
+    if call_counter["hira"] >= HIRA_CALL_LIMIT:
+        return result
+    call_counter["hira"] += 1
+    try:
+        items = hira_cmpn_get(service_key, params)
+    except (requests.RequestException, ValueError, ET.ParseError) as exc:
+        errors.append(f"HIRA 성분약효 {cache_key}: {exc}")
+        return result
+    if gnl_nm_cd:
+        matched = [item for item in items if clean_whitespace(item.get(HIRA_GNL_CODE_FIELD, "")) == gnl_nm_cd] or items
+        if matched:
+            for api_key, column in HIRA_CMPN_FIELDS.items():
+                result[column] = clean_whitespace(matched[0].get(api_key, ""))
+    else:
+        matched = [item for item in items if clean_whitespace(item.get(HIRA_MEFT_FIELD, "")) == meft_div_no] or items
+        names = list(dict.fromkeys(clean_whitespace(item.get("divNm", "")) for item in matched))
+        result["분류명"] = " / ".join(name for name in names if name)
+    cache_cmpn[cache_key] = result
+    return dict(result)
+
+
+def mfds_class_to_meft(class_no):
+    """식약처 5자리 분류번호 "01190" → 심평원 3자리 약효분류번호 "119" (가운데 3자리)."""
+    digits = re.sub(r"\D", "", str(class_no or ""))
+    if len(digits) == 5:
+        return digits[1:4]
+    if len(digits) == 4:
+        return digits[:3]
+    return digits if len(digits) == 3 else ""
+
+
+_PILL_URL_STATE = {"working": None}
+
+
+def mfds_pill_get(service_key, item_seq):
+    """낱알식별 API를 후보 주소 순서대로 시도합니다. 응답이 온 주소는 기억해 다음부터 바로 씁니다."""
+    urls = [_PILL_URL_STATE["working"]] if _PILL_URL_STATE["working"] else MFDS_PILL_URLS
+    last_exc = None
+    for url in urls:
+        params = {"serviceKey": service_key, "item_seq": item_seq, "type": "json", "numOfRows": 10, "pageNo": 1}
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            if resp.status_code == 404:
+                last_exc = ValueError(f"주소 없음: {url}")
+                continue
+            text = resp.text or ""
+            # 정상 응답에는 항상 totalCount가 있습니다. 활용신청 전·잘못된 주소일 때 오는 오류 문서는 오류로 처리합니다.
+            if "totalCount" not in text:
+                reason = re.search(r"<(?:returnAuthMsg|returnReasonCode|resultMsg)>([^<]+)<", text)
+                last_exc = ValueError(f"{url.rsplit('/', 1)[-1]}: {reason.group(1) if reason else text[:120]}")
+                continue
+            items = _parse_response_items(resp, "MFDS 낱알식별")
+        except (requests.RequestException, ValueError, ET.ParseError) as exc:
+            last_exc = exc
+            continue
+        _PILL_URL_STATE["working"] = url
+        return items
+    raise last_exc or ValueError("MFDS 낱알식별 API 호출 실패")
+
+
+def get_mfds_pill_class(item_seq, service_key, call_counter, cache_pill, errors):
+    """낱알식별 정보의 CLASS_NO/CLASS_NAME → (심평원식 3자리 약효분류번호, 분류명, 식약처 분류번호)."""
+    item_seq = clean_whitespace(item_seq)
+    if not item_seq or not service_key:
+        return "", "", ""
+    if item_seq in cache_pill:
+        found = cache_pill[item_seq]
+        return found.get("meft", ""), found.get("name", ""), found.get("class_no", "")
+    if call_counter["mfds"] >= MFDS_CALL_LIMIT:
+        return "", "", ""
+    call_counter["mfds"] += 1
+    try:
+        items = mfds_pill_get(service_key, item_seq)
+    except (requests.RequestException, ValueError, ET.ParseError) as exc:
+        # 활용신청 전이거나 일시 오류일 수 있으므로 실패는 캐시하지 않습니다.
+        errors.append(f"MFDS 낱알식별 item_seq={item_seq}: {exc}")
+        return "", "", ""
+    matched = [item for item in items if clean_whitespace(item.get("ITEM_SEQ", "")) == item_seq] or items
+    first = matched[0] if matched else {}
+    class_no = clean_whitespace(first.get("CLASS_NO", ""))
+    name = clean_whitespace(first.get("CLASS_NAME", ""))
+    found = {"meft": mfds_class_to_meft(class_no), "name": name, "class_no": class_no}
+    # 낱알 의약품이 아니어서 결과가 없는 경우도 저장해 같은 품목을 다시 묻지 않습니다.
+    cache_pill[item_seq] = found
+    return found["meft"], found["name"], found["class_no"]
+
+
+def parse_material_name(text):
+    """식약처 MATERIAL_NAME(원료약품 및 분량)을 성분별 목록으로 나눕니다.
+    예: "총량 : 1캡슐258.8밀리그램|성분명 : 발베나진이토실산염|분량 : 73|단위 : 밀리그램|규격 : 별규|성분정보 : 발베나진(으)로서 40 밀리그램"
+    성분이 여러 개면 ";"로 이어져 옵니다."""
+    components = []
+    for chunk in re.split(r";(?=\s*(?:총량|성분명)\s*:)", str(text or "")):
+        fields = {}
+        for part in chunk.split("|"):
+            if ":" in part:
+                key, value = part.split(":", 1)
+                fields[clean_whitespace(key)] = clean_whitespace(value)
+        if fields.get("성분명"):
+            components.append(fields)
+    return components
+
+
+def mfds_component_info(detail):
+    """식약처 상세의 원료약품 및 분량으로 일반명·함량내용·단위를 만듭니다(성분이 여러 개면 줄바꿈)."""
+    material = detail.get("_raw_원료약품및분량") or (detail.get("_all_api_fields") or {}).get("MATERIAL_NAME", "")
+    components = parse_material_name(material)
+    if not components:
+        return {}
+    amounts = []
+    for comp in components:
+        amount = comp.get("분량", "")
+        basis = comp.get("성분정보", "")
+        # "발베나진(으)로서 40 밀리그램"처럼 기준 성분 함량이 있으면 괄호로 함께 적습니다.
+        amounts.append(f"{amount} ({basis})" if amount and basis else amount or basis)
+    return {
+        "일반명": "\n".join(comp.get("성분명", "") for comp in components),
+        "함량내용": "\n".join(amounts),
+        "단위": "\n".join(comp.get("단위", "") for comp in components),
+    }
+
+
+ROUTE_KEYWORDS = [
+    # (투여경로, 제품명·성상에 나오는 단서). 위에서부터 먼저 맞는 것을 씁니다.
+    ("주사", ["주사", "주(", "주]", "프리필드", "펜주", "바이알", "앰플", "앰풀", "수액", "점적주"]),
+    ("외용", ["연고", "크림", "겔", "젤", "로션", "패치", "플라스타", "카타플라스마", "점안", "점이", "점비", "외용",
+             "스프레이", "에어로솔", "좌제", "좌약", "질정", "질크림", "흡입", "네뷸", "가글", "구강용", "치과용", "샴푸",
+             "폼", "파프", "필름", "트랜스더멀"]),
+    ("내복", ["정", "캡슐", "시럽", "과립", "산(", "세립", "현탁", "내용액", "츄어블", "드링크", "엘릭서", "환", "건조시럽"]),
+]
+
+
+def guess_route(item_name, chart=""):
+    """제품명(괄호 속 성분명 제외)과 성상으로 투여경로(내복/주사/외용)를 추정합니다. 모르면 빈 값."""
+    name = re.sub(r"\(.*?\)", "", str(item_name or ""))
+    name = re.sub(r"\d+(\.\d+)?\s*(밀리그램|마이크로그램|그램|밀리리터|리터|단위|mg|g|ml|mL|%|퍼센트)", "", name)
+    if re.search(r"주\s*$|주\s*\d|주사", name):
+        return "주사"
+    # 제품명에서 먼저 찾고, 제품명으로 알 수 없을 때만 성상 문장을 봅니다.
+    for text in (name, str(chart or "")):
+        for route, words in ROUTE_KEYWORDS:
+            if any(word in text for word in words):
+                return route
+    return ""
+
+
+def normalize_ingredient_name(text):
+    return re.sub(r"[\s()\[\]·,.\-]", "", str(text or "")).casefold()
+
+
+def ingredient_search_names(detail, list_row):
+    """심평원 일반명 검색어 후보: 기준 성분명(…(으)로서) → 염 포함 한글 성분명 → 영문 성분명."""
+    names = []
+    for comp in parse_material_name(detail.get("_raw_원료약품및분량") or (detail.get("_all_api_fields") or {}).get("MATERIAL_NAME", "")):
+        basis = re.match(r"\s*(.+?)\s*\(으\)\s*로서", comp.get("성분정보", ""))
+        if basis:
+            names.append(basis.group(1))
+        names.append(comp.get("성분명", ""))
+    names += [part for part in re.split(r"[|,]", detail.get("성분명", "")) if part.strip()]
+    names.append(detail.get("주성분영문명", "") or list_row.get("MAIN_INGR_ENG", ""))
+    out = []
+    for name in names:
+        name = clean_whitespace(name)
+        if len(normalize_ingredient_name(name)) >= 2 and name not in out:
+            out.append(name)
+    return out[:4]
+
+
+def hira_items_by_name(name, service_key, call_counter, cache_cmpn, errors):
+    """심평원 성분약효 API를 일반명 부분일치(%이름%)로 조회합니다. 필요한 필드만 캐시합니다."""
+    cache_key = f"gnlNmItems:{name.casefold()}"
+    if cache_key in cache_cmpn:
+        return cache_cmpn[cache_key]
+    if call_counter["hira"] >= HIRA_CALL_LIMIT:
+        return None
+    call_counter["hira"] += 1
+    try:
+        items = hira_cmpn_get(service_key, {"gnlNm": name})
+    except (requests.RequestException, ValueError, ET.ParseError) as exc:
+        errors.append(f"HIRA 성분약효 gnlNm={name}: {exc}")
+        return None
+    slim = [
+        {
+            "gnlNm": clean_whitespace(item.get("gnlNm", "")),
+            "gnlNmCd": clean_whitespace(item.get(HIRA_GNL_CODE_FIELD, "")),
+            "meftDivNo": clean_whitespace(item.get(HIRA_MEFT_FIELD, "")),
+            "divNm": clean_whitespace(item.get("divNm", "")),
+            # 가이드 예시에서 같은 항목 이름이 두 가지로 와서 둘 다 받습니다.
+            "route": clean_whitespace(item.get("injcPthNm") or item.get("injcPthCdNm") or ""),
+            "form": clean_whitespace(item.get("fomnTpNm") or item.get("fomnTpCdNm") or ""),
+        }
+        for item in items
+    ]
+    cache_cmpn[cache_key] = slim
+    return slim
+
+
+FORM_KEYWORDS = ["점안", "점이", "점비", "연고", "크림", "겔", "젤", "로션", "패치", "좌", "질", "흡입", "가글",
+                 "스프레이", "에어로솔", "시럽", "현탁", "과립", "캡슐", "정", "산", "액", "주사"]
+
+
+def hira_class_by_ingredient(names, service_key, call_counter, cache_cmpn, errors, route="", item_name=""):
+    """심평원 성분약효 API를 성분명으로 조회해 약효분류를 찾습니다.
+    - 일반명이 검색어로 시작하는 항목만 남깁니다(예: '프레드니솔론'으로 '메틸프레드니솔론'이 섞이지 않게).
+    - 제품의 투여경로(내복/주사/외용)를 알면 같은 경로 항목만 남깁니다. 같은 성분도 제형마다 분류가 다르기 때문입니다.
+    - 남은 항목의 약효분류가 하나로 모일 때만 사용합니다. 여러 개면 경고에 후보를 남기고 비워 둡니다."""
+    for name in names:
+        items = hira_items_by_name(name, service_key, call_counter, cache_cmpn, errors)
+        if not items:
+            continue
+        key = normalize_ingredient_name(name)
+        matched = [item for item in items if normalize_ingredient_name(item["gnlNm"]).startswith(key)]
+        if route:
+            same_route = [item for item in matched if route in item["route"]]
+            # 경로 정보가 아예 없는 응답이면 경로 조건 없이 판단합니다.
+            if same_route or any(item["route"] for item in matched):
+                matched = same_route
+        classes = {(item["meftDivNo"], item["divNm"]) for item in matched} - {("", "")}
+        if len(classes) > 1 and item_name:
+            # 같은 경로 안에서도 제형(점안제·연고제 등)에 따라 분류가 갈리면, 제품명에 나온 제형으로 한 번 더 좁힙니다.
+            product = re.sub(r"\(.*?\)", "", item_name)
+            for word in FORM_KEYWORDS:
+                if word in product:
+                    narrowed = {(i["meftDivNo"], i["divNm"]) for i in matched if word in i.get("form", "")} - {("", "")}
+                    if narrowed:
+                        classes = narrowed
+                        break
+        if len(classes) == 1:
+            return list(classes)[0]
+        if len(classes) > 1:
+            listed = ", ".join(f"{no} {nm}" for no, nm in sorted(classes)[:5])
+            errors.append(f"약효분류 후보가 여러 개라 비워 둠 (성분 {name}, 경로 {route or '미상'}): {listed}")
+            return "", ""
+    return "", ""
+
+
+def fill_non_covered(meft_div_no, cmpn_info, list_row, detail, service_key, call_counter, cache_cmpn, errors,
+                     mfds_key="", cache_pill=None, class_source=""):
+    """심평원 약가(급여) 목록에 없어 비어 있는 약효분류·성분 항목을 식약처 자료로 채웁니다.
+    순서: 심평원 약가 → 식약처 낱알식별(CLASS_NO) → 심평원 성분약효(성분명 조회) / 성분은 식약처 원료약품 및 분량."""
+    info = dict(cmpn_info)
+    class_source = (class_source or "심평원") if meft_div_no or info.get("분류명") else ""
+    if not meft_div_no or not info.get("분류명"):
+        mfds_no, mfds_name, _ = get_mfds_pill_class(
+            list_row.get("ITEM_SEQ", ""), mfds_key, call_counter,
+            cache_pill if cache_pill is not None else {}, errors,
+        )
+        if mfds_no or mfds_name:
+            meft_div_no = meft_div_no or mfds_no
+            info["분류명"] = info.get("분류명") or mfds_name
+            class_source = class_source or "식약처 낱알식별"
+    if not meft_div_no or not info.get("분류명"):
+        route = guess_route(list_row.get("ITEM_NAME", ""), detail.get("_raw_성상", ""))
+        hira_no, hira_name = hira_class_by_ingredient(
+            ingredient_search_names(detail, list_row), service_key, call_counter, cache_cmpn, errors,
+            route=route, item_name=list_row.get("ITEM_NAME", ""),
+        )
+        if hira_no or hira_name:
+            meft_div_no = meft_div_no or hira_no
+            info["분류명"] = info.get("분류명") or hira_name
+            class_source = class_source or "심평원(성분명 조회)"
+    component_source = "심평원" if info.get("일반명") else ""
+    if not info.get("일반명"):
+        mfds_info = mfds_component_info(detail)
+        if mfds_info:
+            info.update({key: value for key, value in mfds_info.items() if not info.get(key)})
+            component_source = "식약처 원료약품및분량"
+    info["분류출처"] = class_source
+    info["성분출처"] = component_source
+    return meft_div_no, info
+
+
+def find_nonpay_list_file():
+    """data/비급여목록/ 폴더의 엑셀, 또는 app.py와 같은 폴더에 있고 이름에 '비급여'가 들어간 엑셀 중
+    파일 이름이 가장 뒤인 것(20261101_… 처럼 날짜로 시작하면 가장 최근 것)을 고릅니다."""
+    candidates = []
+    if NONPAY_LIST_DIR.is_dir():
+        candidates += [path for path in NONPAY_LIST_DIR.iterdir()]
+    candidates += [path for path in NONPAY_LIST_DIR.parent.parent.iterdir() if "비급여" in path.name]
+    files = [
+        path for path in candidates
+        if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"} and not path.name.startswith("~$")
+    ]
+    return max(files, key=lambda path: path.name) if files else None
+
+
+def _nonpay_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return clean_whitespace(str(value))
+
+
+@st.cache_resource(show_spinner="심평원 비급여 의약품 목록을 읽는 중입니다…")
+def load_nonpay_index(path_string, mtime):
+    """비급여 목록 엑셀을 바코드(의약품표준코드)·품목코드(식약처품목기준코드)로 찾을 수 있게 읽습니다."""
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path_string, read_only=True, data_only=True)
+    sheet = next((ws for ws in workbook.worksheets if ws.title.startswith("전체")), workbook.worksheets[0])
+    rows = sheet.iter_rows(values_only=True)
+    header = None
+    for row in rows:
+        names = [_nonpay_text(cell) for cell in row]
+        if "식약처품목기준코드" in names:
+            header = names
+            break
+    if header is None:
+        workbook.close()
+        raise ValueError("비급여 목록에서 '식약처품목기준코드' 머리글을 찾지 못했습니다.")
+    col = {name: index for index, name in enumerate(header) if name}
+
+    def get(row, name):
+        index = col.get(name)
+        return _nonpay_text(row[index]) if index is not None and index < len(row) else ""
+
+    by_barcode, by_seq, count = {}, {}, 0
+    for row in rows:
+        seq = get(row, "식약처품목기준코드")
+        if not seq:
+            continue
+        record = {
+            "item_seq": seq,
+            "barcode": normalize_code_digits(get(row, "의약품표준코드")),
+            "product_name": get(row, "제품명"),
+            "gnlNmCd": get(row, "주성분코드"),
+            "meftDivNo": get(row, "분류번호"),
+            "ingredient": get(row, "영문성분명 및 함량(단위)"),
+            "route": get(row, "투여경로"),
+        }
+        count += 1
+        if record["barcode"]:
+            by_barcode[record["barcode"]] = record
+        by_seq.setdefault(seq, []).append(record)
+    workbook.close()
+    date_match = re.match(r"(\d{8})", Path(path_string).name)
+    label = date_match.group(1) if date_match else Path(path_string).stem
+    return {"by_barcode": by_barcode, "by_seq": by_seq, "count": count, "label": label, "sheet": sheet.title}
+
+
+def match_nonpay(index, item_seq, bar_code):
+    """바코드가 맞는 줄을 먼저 쓰고, 없으면 같은 품목코드의 모든 줄(포장별)을 돌려줍니다."""
+    if not index:
+        return []
+    records = [index["by_barcode"][code] for code in split_barcode_values(bar_code) if code in index["by_barcode"]]
+    return records or list(index["by_seq"].get(clean_whitespace(item_seq), []))
+
+
+def component_info_multi(meft_div_no, gnl_codes, service_key, call_counter, cache_cmpn, errors):
+    """주성분코드가 여러 개(포장·함량별)면 각각 조회해 같은 칸에 줄바꿈으로 이어 붙입니다(같은 값은 한 번만)."""
+    if len(gnl_codes) <= 1:
+        return get_component_info(meft_div_no, gnl_codes[0] if gnl_codes else "", service_key, call_counter, cache_cmpn, errors)
+    merged = {column: [] for column in HIRA_CMPN_FIELDS.values()}
+    for code in gnl_codes[:5]:
+        info = get_component_info(meft_div_no, code, service_key, call_counter, cache_cmpn, errors)
+        for column, value in info.items():
+            if value and value not in merged[column]:
+                merged[column].append(value)
+    return {column: "\n".join(values) for column, values in merged.items()}
 
 
 DOC_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (drug-information app)"}
@@ -1480,6 +2021,36 @@ def fetch_list_page(page, mfds_key):
     raise last_err
 
 
+def load_list_resume(temp_file, cache_day):
+    """허가목록 임시 파일을 {페이지번호: 항목목록}, 총건수로 읽습니다. 날짜가 다르거나 읽을 수 없으면 버립니다."""
+    if not temp_file.exists():
+        return {}, None
+    try:
+        with temp_file.open("r", encoding="utf-8") as file:
+            resume = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}, None
+    if "pages" in resume:
+        if resume.get("cache_day") != cache_day:
+            return {}, None
+        return {int(page): items for page, items in resume["pages"].items()}, resume.get("total_count")
+    # 이전 버전 형식: 1페이지부터 next_page-1페이지까지 차례로 이어 붙인 rows
+    rows, next_page = resume.get("rows", []), int(resume.get("next_page", 1))
+    pages = {
+        page: rows[(page - 1) * LIST_NUM_OF_ROWS: page * LIST_NUM_OF_ROWS]
+        for page in range(1, next_page)
+    }
+    return {page: items for page, items in pages.items() if items}, resume.get("total_count")
+
+
+def save_list_resume(temp_file, cache_day, pages, total_count):
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            {"cache_day": cache_day, "total_count": total_count, "pages": {str(page): items for page, items in pages.items()}},
+            file, ensure_ascii=False,
+        )
+
+
 # cache_data → cache_resource: cache_data는 호출할 때마다 수만 건 목록을 복사(역직렬화)하지만,
 # cache_resource는 같은 객체를 그대로 돌려주므로 매 재실행마다 드는 비용이 거의 없습니다.
 # (반환된 목록은 읽기 전용으로만 사용하세요.)
@@ -1508,31 +2079,51 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
     if not mfds_key:
         raise ValueError("오늘 날짜의 허가목록 캐시가 없습니다. 식약처 인증키를 입력해야 허가목록을 갱신할 수 있습니다.")
 
-    if temp_file.exists():
-        with temp_file.open("r", encoding="utf-8") as file:
-            resume = json.load(file)
-        all_rows, page, total_count = resume["rows"], resume["next_page"], resume.get("total_count")
-    else:
-        all_rows, page, total_count = [], 1, None
+    # 이어받기: 같은 날 수집하다 멈춘 임시 파일이 있으면 받은 페이지는 건너뜁니다.
+    pages, total_count = load_list_resume(temp_file, cache_day)
 
     progress = st.progress(0, text="식약처 허가목록을 수집하는 중입니다…")
-    while True:
-        body, items = fetch_list_page(page, mfds_key)
-        if total_count is None:
-            total_count = int(body.get("totalCount", 0))
-        if not items:
-            break
-        all_rows.extend(items)
-        page += 1
+    if 1 not in pages or total_count is None:
+        body, items = fetch_list_page(1, mfds_key)
+        total_count = int(body.get("totalCount", 0) or 0)
+        pages[1] = items
+    total_pages = max(1, math.ceil(total_count / LIST_NUM_OF_ROWS)) if total_count else 1
+    remaining = [page for page in range(2, total_pages + 1) if page not in pages]
+
+    def report():
+        done = sum(len(items) for items in pages.values())
         if total_count:
-            progress.progress(min(len(all_rows) / total_count, 1.0), text=f"허가목록 수집 중: {len(all_rows):,}/{total_count:,}")
-        if page % 10 == 0 or (total_count and len(all_rows) >= total_count):
-            with temp_file.open("w", encoding="utf-8") as file:
-                json.dump({"rows": all_rows, "next_page": page, "total_count": total_count}, file, ensure_ascii=False)
-        if total_count and len(all_rows) >= total_count:
-            break
-        time.sleep(0.1)
+            progress.progress(
+                min(done / total_count, 1.0),
+                text=f"허가목록 수집 중: {done:,}/{total_count:,} (동시 {LIST_FETCH_WORKERS}페이지)",
+            )
+
+    report()
+    failures = []
+    # 페이지를 여러 개 동시에 받습니다. Streamlit 화면 갱신과 파일 저장은 이 루프(메인 스레드)에서만 합니다.
+    with ThreadPoolExecutor(max_workers=LIST_FETCH_WORKERS) as pool:
+        futures = {pool.submit(fetch_list_page, page, mfds_key): page for page in remaining}
+        for count, future in enumerate(as_completed(futures), start=1):
+            page = futures[future]
+            try:
+                _, items = future.result()
+            except (requests.RequestException, ValueError) as exc:
+                failures.append((page, exc))
+                continue
+            pages[page] = items
+            report()
+            if count % LIST_TEMP_SAVE_EVERY == 0:
+                save_list_resume(temp_file, cache_day, pages, total_count)
+    if failures:
+        save_list_resume(temp_file, cache_day, pages, total_count)
+        progress.empty()
+        failed = ", ".join(str(page) for page, _ in sorted(failures, key=lambda pair: pair[0])[:10])
+        raise RuntimeError(
+            f"허가목록 {len(failures)}개 페이지를 받지 못했습니다(페이지 {failed}…). "
+            f"받은 페이지는 저장했으니 다시 실행하면 나머지만 이어서 받습니다. 마지막 오류: {failures[-1][1]}"
+        )
     progress.empty()
+    all_rows = [row for page in sorted(pages) for row in pages[page]]
 
     with list_file.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=LIST_CSV_FIELDS, extrasaction="ignore")
@@ -1545,20 +2136,51 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
     return all_rows
 
 
-def detail_cache_mtime():
-    return CACHE_DETAIL_FILE.stat().st_mtime if CACHE_DETAIL_FILE.exists() else 0
+def search_light_mtime():
+    return CACHE_SEARCH_LIGHT_FILE.stat().st_mtime if CACHE_SEARCH_LIGHT_FILE.exists() else 0
+
+
+def light_entry(detail):
+    return [detail.get("성분명", ""), detail.get("주성분영문명", "")]
+
+
+def load_search_light():
+    """검색보조 캐시를 읽습니다. 없으면(이전 버전) 상세정보 캐시에서 한 번만 만들어 저장합니다."""
+    if CACHE_SEARCH_LIGHT_FILE.exists():
+        return load_json_cache(CACHE_SEARCH_LIGHT_FILE)
+    if not CACHE_DETAIL_FILE.exists():
+        return {}
+    light = {seq: light_entry(d) for seq, d in load_json_cache(CACHE_DETAIL_FILE).items() if isinstance(d, dict)}
+    save_json_cache(CACHE_SEARCH_LIGHT_FILE, light)
+    return light
+
+
+def update_search_light(cache_detail, item_seqs):
+    """조회한 품목의 성분명만 검색보조 캐시에 반영합니다. 값이 그대로면 파일을 다시 쓰지 않아 검색 인덱스도 다시 만들지 않습니다."""
+    light = load_search_light()
+    changed = False
+    for seq in item_seqs:
+        detail = cache_detail.get(str(seq))
+        if not isinstance(detail, dict):
+            continue
+        entry = light_entry(detail)
+        if light.get(str(seq)) != entry:
+            light[str(seq)] = entry
+            changed = True
+    if changed:
+        save_json_cache(CACHE_SEARCH_LIGHT_FILE, light)
 
 
 @st.cache_resource(show_spinner=False)
-def build_search_index(_normal_rows, cache_day, row_count, detail_mtime):
+def build_search_index(_normal_rows, cache_day, row_count, light_mtime):
     """검색용 소문자 문자열과 성분명 경량 캐시를 한 번만 만들어 재사용합니다.
-    상세 조회를 하면 캐시 파일 수정시간(detail_mtime)이 바뀌어 인덱스가 한 번 다시 만들어집니다."""
-    detail = load_json_cache(CACHE_DETAIL_FILE)
+    조회로 새 성분명이 생겨 검색보조 캐시(light_mtime)가 바뀔 때만 인덱스를 다시 만듭니다.
+    (예전에는 큰 상세정보 캐시 전체를 다시 읽었기 때문에, 조회 후 첫 검색이 느렸습니다.)"""
+    stored = load_search_light()
     index, light = [], {}
     for row in _normal_rows:
         seq = str(row.get("ITEM_SEQ", ""))
-        d = detail.get(seq, {})
-        ingr, ingr_eng = d.get("성분명", ""), d.get("주성분영문명", "")
+        ingr, ingr_eng = (list(stored.get(seq) or []) + ["", ""])[:2]
         blob = " ".join(str(v) for v in [
             row.get("ITEM_NAME", ""), row.get("ENTP_NAME", ""),
             row.get("MAIN_ITEM_INGR", ""), row.get("MAIN_INGR_ENG", ""),
@@ -1682,7 +2304,7 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 
     headers = [str(column) for column in table_df.columns]
     long_columns = {"효능효과", "용법용량", "성분명", "이상반응", "상호작용", "금기사항", "원료약품및분량"}
-    narrow_columns = {"약가", "제약사한글명", "약효분류"}
+    narrow_columns = {"약가", "제약사한글명", "약효분류", "단위"}
 
     def cell(value):
         if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
@@ -1829,8 +2451,22 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     cache_name = load_json_cache(CACHE_NAME_FILE)
     cache_detail = load_json_cache(CACHE_DETAIL_FILE)
     cache_meft = load_json_cache(CACHE_MEFT_FILE)
+    cache_cmpn = load_json_cache(CACHE_CMPN_FILE)
+    cache_pill = load_json_cache(CACHE_PILL_FILE)
+    nonpay_index = None
+    nonpay_file = find_nonpay_list_file()
+    if nonpay_file:
+        try:
+            nonpay_index = load_nonpay_index(str(nonpay_file), nonpay_file.stat().st_mtime)
+        except Exception as exc:  # 엑셀 형식이 바뀌어도 나머지 조회는 계속합니다.
+            nonpay_index = None
+            nonpay_error = f"심평원 비급여 목록({nonpay_file.name}) 읽기 실패: {exc}"
+        else:
+            nonpay_error = ""
+    else:
+        nonpay_error = ""
     call_counter = {"hira": 0, "mfds": 0}
-    errors = []
+    errors = [nonpay_error] if nonpay_error else []
     columns = BASE_COLUMNS + wanted_extras
     output = []
     reference_items = []
@@ -1857,9 +2493,32 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
         price_failed = not price_items and (detail_failed or method == "호출한도초과" or len(errors) > errors_before_price)
         price_item = price_items[0] if price_items else None
         errors_before_meft = len(errors)
-        effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
+        meft_info = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
+        effect_classification = meft_info.get(HIRA_MEFT_FIELD, "")
+        gnl_nm_cd = meft_info.get(HIRA_GNL_CODE_FIELD, "")
+        gnl_codes = [gnl_nm_cd] if gnl_nm_cd else []
+        class_source = "심평원 약가" if effect_classification else ""
+        nonpay_records = []
+        if not effect_classification or not gnl_nm_cd:
+            # 급여 약가에 없는 약: 심평원 비급여 의약품 목록에서 분류번호·주성분코드를 찾습니다.
+            nonpay_records = match_nonpay(nonpay_index, item_seq, bar_code)
+            if nonpay_records:
+                np_classes = list(dict.fromkeys(rec["meftDivNo"] for rec in nonpay_records if rec["meftDivNo"]))
+                np_codes = list(dict.fromkeys(rec["gnlNmCd"] for rec in nonpay_records if rec["gnlNmCd"]))
+                if not effect_classification and np_classes:
+                    effect_classification = "\n".join(np_classes)
+                    class_source = f"심평원 비급여목록({nonpay_index['label']})"
+                if not gnl_codes and np_codes:
+                    gnl_codes = np_codes
+                    gnl_nm_cd = "\n".join(np_codes)
+        first_meft = effect_classification.split("\n")[0] if effect_classification else ""
+        cmpn_info = component_info_multi(first_meft, gnl_codes, hira_key, call_counter, cache_cmpn, errors)
+        effect_classification, cmpn_info = fill_non_covered(
+            effect_classification, cmpn_info, row, detail, hira_key, call_counter, cache_cmpn, errors,
+            mfds_key=mfds_key, cache_pill=cache_pill, class_source=class_source,
+        )
         meft_failed = not effect_classification and len(errors) > errors_before_meft
-        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, **cmpn_info, "일반명코드": gnl_nm_cd, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         # 빈 칸은 '조회 실패'와 '자료 없음'으로 나눠 표시합니다. 사람이 채우는 행은 빈칸으로 둡니다.
@@ -1901,6 +2560,20 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
                 "effective_start": clean_whitespace((price_item or {}).get("adtStaDd", "")),
                 "sale_end": clean_whitespace((price_item or {}).get("sellEptDd", "")),
             } if price_item else None,
+            "hira_component": {
+                "meft_div_no": effect_classification,
+                "div_nm": cmpn_info.get("분류명", ""),
+                "gnl_nm_cd": gnl_nm_cd,
+                "gnl_nm": cmpn_info.get("일반명", ""),
+                "iqty_txt": cmpn_info.get("함량내용", ""),
+                "unit": cmpn_info.get("단위", ""),
+                "class_source": cmpn_info.get("분류출처", ""),
+                "nonpay_list_rows": [
+                    {key: rec[key] for key in ("product_name", "barcode", "gnlNmCd", "meftDivNo", "ingredient", "route")}
+                    for rec in nonpay_records
+                ],
+                "component_source": cmpn_info.get("성분출처", ""),
+            },
             "hira_prices": [
                 {
                     "mds_cd": clean_whitespace(item.get("mdsCd", "")),
@@ -1919,14 +2592,18 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     save_json_cache(CACHE_CODE_FILE, cache_code)
     save_json_cache(CACHE_NAME_FILE, cache_name)
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
+    update_search_light(cache_detail, [row.get("ITEM_SEQ", "") for row in rows])
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
+    save_json_cache(CACHE_CMPN_FILE, cache_cmpn)
+    save_json_cache(CACHE_PILL_FILE, cache_pill)
+    errors[:] = [mask_secrets(error, mfds_key, hira_key) for error in errors]
     reference_bundle = {
-        "schema_version": "1.2",
+        "schema_version": "1.5",
         "reference_date": as_of_date.isoformat(),
         "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
         "product_count": len(reference_items),
         "products": reference_items,
-        "api_warnings": errors,
+        "api_warnings": errors,  # 아래에서 인증키를 가린 뒤의 목록입니다(같은 목록 객체).
     }
     return order_result_columns(pd.DataFrame(output)), errors, reference_bundle
 
@@ -2272,11 +2949,20 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
-APP_VERSION = "2026-10-26d · 신청번호별 시트"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
+APP_VERSION = "2026-11-24 · 약가 포장·규격 표시 + v4.8.2 인증키 가림"
+NEEDED_EXTRAS_VERSION = "2026-10-26d"  # 이 app.py와 함께 써야 하는 comparison_extras.py 버전  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
 
 with st.sidebar:
     st.header("환경 설정")
     st.caption(f"앱 버전: {APP_VERSION}")
+    extras_version = getattr(cx, "EXTRAS_VERSION", "")
+    if extras_version >= NEEDED_EXTRAS_VERSION:
+        st.caption(f"comparison_extras.py 버전: {extras_version}")
+    else:
+        st.error(
+            f"comparison_extras.py가 예전 버전입니다 ({extras_version or '버전 표시 없음'}, 필요: {NEEDED_EXTRAS_VERSION}). "
+            "새 comparison_extras.py를 app.py와 같은 저장소에 올린 뒤, Streamlit에서 Manage app → Reboot app을 눌러 주세요."
+        )
     try:
         secret_mfds = st.secrets.get("MFDS_KEY", "")
         secret_hira = st.secrets.get("HIRA_KEY", "")
@@ -2329,6 +3015,12 @@ with st.sidebar:
             st.cache_resource.clear()
             st.success("상세정보 캐시를 비웠습니다. 다음 조회 때 식약처에서 새로 받아옵니다.")
     st.divider()
+    nonpay_file_for_sidebar = find_nonpay_list_file()
+    st.markdown("**심평원 비급여 의약품 목록**")
+    if nonpay_file_for_sidebar:
+        st.caption(f"`{nonpay_file_for_sidebar.name}` 사용 중. 새 목록은 이름에 날짜와 '비급여'를 넣어(예: `20261201_비급여목록.xlsx`) 저장소에 올리면 됩니다.")
+    else:
+        st.caption("목록 파일 없음. 이름에 '비급여'가 들어간 엑셀(예: `20261101_비급여목록.xlsx`)을 app.py 옆에 올리면 비급여 약의 약효분류를 정확히 채웁니다.")
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
 
@@ -2343,14 +3035,15 @@ if not hira_key:
 try:
     all_rows = load_permitted_drugs(mfds_key, str(DATA_DIR), cache_day)
 except Exception as exc:
-    st.error(f"허가목록 수집에 실패했습니다: {exc}")
-    st.exception(exc)
+    st.error(mask_secrets(f"허가목록 수집에 실패했습니다: {exc}", mfds_key, hira_key))
+    # st.exception은 오류 문구를 그대로 보여 주므로, 인증키를 가린 traceback을 대신 보여 줍니다.
+    st.code(mask_secrets(traceback.format_exc(), mfds_key, hira_key), language="text")
     st.stop()
 
 normal_rows = [row for row in all_rows if row.get("CANCEL_NAME") == "정상"]
 by_seq = {row.get("ITEM_SEQ", ""): row for row in normal_rows}
 search_index, search_light = build_search_index(
-    normal_rows, cache_day, len(normal_rows), detail_cache_mtime()
+    normal_rows, cache_day, len(normal_rows), search_light_mtime()
 )
 st.success(f"정상 품목 {len(normal_rows):,}건 준비 완료")
 
@@ -2706,6 +3399,9 @@ if batch_results:
             "sources": dosage_sources(item["result"], item["reference"]),
         })
     batch_date = (batch_results[0]["reference"] or {}).get("reference_date", "")
+    if not hasattr(cx, "to_excel_bytes_by_number"):
+        st.error("신청번호별 시트를 만들려면 새 comparison_extras.py가 필요합니다. 올린 뒤 Manage app → Reboot app을 눌러 주세요. (사이드바 버전 확인)")
+        st.stop()
     st.download_button(
         "비교표 Excel 다운로드 (신청번호별 시트)",
         data=cx.to_excel_bytes_by_number(
@@ -2783,9 +3479,9 @@ if st.session_state.last_result is not None:
         csv_suffix = "_행열전환" if transpose_view else ""
         st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}{csv_suffix}.csv", mime="text/csv")
         if st.session_state.last_reference_json is not None:
-            reference_json_bytes = json.dumps(
+            reference_json_bytes = mask_secrets(json.dumps(
                 st.session_state.last_reference_json, ensure_ascii=False, indent=2
-            ).encode("utf-8")
+            ), mfds_key, hira_key).encode("utf-8")
             reference_date = st.session_state.last_reference_json.get("reference_date", "")
             st.download_button(
                 "AI 검토용 JSON 다운로드",
@@ -2822,4 +3518,4 @@ if st.session_state.last_result is not None:
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
             for error in st.session_state.last_errors:
-                st.warning(error)
+                st.warning(mask_secrets(error, mfds_key, hira_key))
