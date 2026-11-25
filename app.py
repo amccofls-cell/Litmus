@@ -481,6 +481,25 @@ def link_app_input(frame, rows, mfds_key, hira_key):
     return links, errors
 
 
+def link_choice(row):
+    """후보 고르기 칸의 글: '제품명 · 제약사 · 품목기준코드' (품목기준코드는 맨 끝, picked_seq가 읽음)"""
+    return f"{row.get('ITEM_NAME', '')} · {row.get('ENTP_NAME', '')} · {row.get('ITEM_SEQ', '')}"
+
+
+def link_search_rows(index_rows, query, limit=30):
+    """'파일로 품목 추가'에서 연결 못 한 줄을 위한 식약처 품목 검색 (아래 의약품 검색과 같은 색인 사용)."""
+    words = [word for word in str(query or "").casefold().split() if word]
+    if not words:
+        return []
+    found = []
+    for blob, row in index_rows:
+        if all(word in blob for word in words):
+            found.append({"ITEM_SEQ": row.get("ITEM_SEQ", ""), "ITEM_NAME": row.get("ITEM_NAME", ""), "ENTP_NAME": row.get("ENTP_NAME", "")})
+            if len(found) >= limit:
+                break
+    return found
+
+
 def apply_file_links(links, replace):
     """연결된 품목을 신청의약품·비교의약품 그룹에 넣고 그룹 모드를 켭니다. (버튼 on_click용)"""
     if replace:
@@ -2949,7 +2968,7 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
-APP_VERSION = "2026-11-24 · 약가 포장·규격 표시 + v4.8.2 인증키 가림"
+APP_VERSION = "2026-11-25 · 파일로 품목 추가에서 직접 찾기"
 NEEDED_EXTRAS_VERSION = "2026-10-26d"  # 이 app.py와 함께 써야 하는 comparison_extras.py 버전  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
 
 with st.sidebar:
@@ -3128,12 +3147,23 @@ with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프�
             if link["seq"]:
                 st.markdown(f"✅ {label} → **{link['연결 품목']}** · {link['방법']}")
             else:
-                choices = ["(넣지 않음)"] + [f"{c['ITEM_NAME']} · {c['ENTP_NAME']} · {c['ITEM_SEQ']}" for c in link["후보"]]
-                st.selectbox(
-                    f"⚠️ {label} — " + (f"{link.get('후보 근거') or '이름'}으로 찾은 후보 중에서 골라 주세요" if link["후보"]
-                                       else "찾지 못했습니다. 검색에서 직접 추가해 주세요"),
-                    choices, key=f"link_pick_{index}",
-                )
+                pick_col, search_col = st.columns([3, 2])
+                with search_col:
+                    # 후보가 없거나 맞지 않으면 여기서 식약처 품목을 직접 찾아 이 신청번호·구분에 넣습니다.
+                    link_query = st.text_input("식약처 품목 직접 찾기", key=f"link_search_{index}",
+                                               placeholder="약품명·성분명·제약사 (예: 티모프틱)")
+                found = link_search_rows(search_index, link_query)
+                options = [link_choice(c) for c in found] + [link_choice(c) for c in link["후보"]]
+                choices = ["(넣지 않음)"] + list(dict.fromkeys(options))
+                if found and st.session_state.get(f"link_pick_{index}") not in choices[1:len(found) + 1]:
+                    st.session_state[f"link_pick_{index}"] = choices[1]  # 새로 찾으면 첫 결과를 미리 골라 둠
+                with pick_col:
+                    st.selectbox(
+                        f"⚠️ {label} — " + (f"직접 찾은 품목 {len(found)}건 중에서 골라 주세요" if found
+                                           else f"{link.get('후보 근거') or '이름'}으로 찾은 후보 중에서 고르거나, 오른쪽에서 직접 찾아 주세요" if link["후보"]
+                                           else "찾지 못했습니다. 오른쪽 칸에서 식약처 품목을 직접 찾아 주세요"),
+                        choices, key=f"link_pick_{index}",
+                    )
         if st.session_state.get("file_links_all"):
             st.button("신청번호별 묶음으로 준비", type="primary", on_click=prepare_batch, args=(file_links,),
                       help="아래 '3. 조회 설정'의 '신청번호별 묶음 조회'로 모든 신청번호를 한 번에 조회합니다.")
